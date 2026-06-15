@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+bootc-bench-results/
+test-run/
+*.qcow2
+bootc-bench-key
+bootc-bench-key.pub
