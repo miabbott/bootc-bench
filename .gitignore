@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 bootc-bench-results/
 test-run/
+test-run-delta/
 *.qcow2
+*.oci-archive
+*.delta
 bootc-bench-key
 bootc-bench-key.pub
+oci-delta

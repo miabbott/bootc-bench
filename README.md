@@ -130,6 +130,67 @@ Results are written to `<output-dir>/results.json`:
 }
 ```
 
+## Delta mode (oci-delta)
+
+In addition to the default **baseline** mode (full registry pull), bootc-bench
+supports a **delta** mode that uses [oci-delta](https://github.com/containers/oci-delta)
+to create and apply binary deltas between OCI images.
+
+```bash
+# Run delta benchmark (requires oci-delta binary)
+python3 bootc_bench.py -m delta -t registry.redhat.io/rhel9/rhel-bootc:9.8
+
+# Use a custom oci-delta binary path
+python3 bootc_bench.py -m delta --oci-delta-bin /path/to/oci-delta
+
+# With a pre-built qcow2
+python3 bootc_bench.py -m delta --qcow2 /path/to/base.qcow2 -n 5
+```
+
+### How delta mode works
+
+1. **Prepare delta artifacts (once per target):**
+   - Exports the base and target images as OCI archives via `skopeo copy`
+   - Runs `oci-delta create` to produce a binary delta file
+
+2. **Per iteration:**
+   - Provisions a fresh VM (same as baseline)
+   - **Transfer phase:** SCP the delta file + oci-delta binary into the VM
+   - **Apply phase:** Run `oci-delta apply` inside the VM to reconstruct
+     the target OCI archive
+   - **Stage phase:** Run `bootc switch --transport=oci-archive` against
+     the local archive (no registry pull)
+   - **Reboot phase:** Same as baseline
+
+### Delta-specific output fields
+
+| Field | Description |
+|-------|-------------|
+| `delta_artifacts` | Archive sizes, delta size, export/create timings |
+| `delta_transfer_phase` | Time to SCP delta + binary into the VM |
+| `delta_apply_phase` | Time to reconstruct the OCI archive |
+| `delta_file_size_bytes` | Size of the binary delta file |
+
+## HTML report
+
+Generate a self-contained HTML report from the results JSON:
+
+```bash
+# Default: reads ./bootc-bench-results/results.json
+python3 bootc_report.py
+
+# Custom input and output
+python3 bootc_report.py /path/to/results.json -o report.html
+```
+
+The report includes:
+
+- **Summary table** — per-target comparison with mode badges, timing means, and success rates
+- **Timing comparison chart** — stacked bar chart with all phases (transfer, apply, stage, reboot)
+- **Delta size chart** — full image vs delta file size comparison (delta mode only)
+- **Per-target details** — iteration-level tables, per-iteration timing charts, and memory usage time series
+- **Delta artifacts** — archive sizes, compression ratio, and preparation timings (delta mode only)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

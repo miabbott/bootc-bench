@@ -1,0 +1,14 @@
+FROM quay.io/centos/centos:stream9 AS builder
+
+RUN dnf install -y 'dnf-command(config-manager)' && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y golang git make gpgme-devel device-mapper-devel ostree-devel && \
+    dnf clean all
+
+RUN git clone https://github.com/containers/oci-delta.git /build/oci-delta
+
+WORKDIR /build/oci-delta
+RUN go build -tags "exclude_graphdriver_btrfs" -o oci-delta .
+
+FROM scratch
+COPY --from=builder /build/oci-delta/oci-delta /oci-delta

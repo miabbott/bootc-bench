@@ -41,8 +41,9 @@ DEFAULT_TARGETS = [
 DEFAULT_ITERATIONS = 3
 DEFAULT_VM_MEMORY_MB = 4096
 DEFAULT_VM_VCPUS = 2
-DEFAULT_VM_DISK_GB = 20
+DEFAULT_VM_DISK_GB = 40
 BIB_IMAGE = "registry.redhat.io/rhel9/bootc-image-builder"
+OCI_DELTA_BIN_DEFAULT = "./oci-delta"
 MONITOR_INTERVAL_SEC = 2
 SSH_TIMEOUT_SEC = 300
 SSH_PORT = 22
@@ -88,6 +89,12 @@ class IterationResult:
     layers_pulled: Optional[int] = None
     layer_details: list = field(default_factory=list)
     disk_delta_bytes: Optional[int] = None
+    # Delta-mode fields
+    delta_transfer_phase: Optional[PhaseResult] = None
+    delta_apply_phase: Optional[PhaseResult] = None
+    delta_file_size_bytes: Optional[int] = None
+    delta_apply_output: str = ""
+    mode: str = "baseline"
     cpu_samples: list = field(default_factory=list)
     memory_samples: list = field(default_factory=list)
     error: Optional[str] = None
@@ -333,6 +340,38 @@ class VMManager:
 # ---------------------------------------------------------------------------
 # Resource monitor (runs in background thread)
 # ---------------------------------------------------------------------------
+
+class SudoKeepalive:
+    """Keep sudo credentials alive in a background thread."""
+
+    def __init__(self, interval: float = 60):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        # Initial sudo -v to cache credentials
+        subprocess.run(["sudo", "-v"], check=True)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        log.debug("Sudo keepalive started")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._stop.wait(self.interval)
+            if not self._stop.is_set():
+                try:
+                    subprocess.run(["sudo", "-v"], check=True,
+                                   capture_output=True, timeout=10)
+                except Exception:
+                    pass
+
 
 class ResourceMonitor:
     """Collect CPU/memory samples in a background thread."""
@@ -965,6 +1004,318 @@ def run_iteration(
 
 
 # ---------------------------------------------------------------------------
+# Delta mode: preparation and iteration
+# ---------------------------------------------------------------------------
+
+def export_oci_archive(image_ref: str, output_path: Path,
+                       authfile: Optional[str] = None) -> float:
+    """Export a container image to an OCI archive via skopeo. Returns duration."""
+    if output_path.exists():
+        log.info("OCI archive already exists: %s", output_path)
+        return 0.0
+    log.info("Exporting %s to %s ...", image_ref, output_path)
+    cmd = ["skopeo", "copy",
+           "--override-arch", "amd64",
+           "--remove-signatures",
+           f"docker://{image_ref}",
+           f"oci-archive:{output_path}"]
+    if authfile:
+        cmd.extend(["--authfile", authfile])
+    start = time.time()
+    subprocess.run(cmd, check=True)
+    duration = time.time() - start
+    size_mb = output_path.stat().st_size / 1024**2
+    log.info("Exported %s (%.0f MB) in %.1fs", output_path.name, size_mb, duration)
+    return duration
+
+
+def create_delta(oci_delta_bin: Path, old_archive: Path, new_archive: Path,
+                 delta_path: Path) -> tuple[float, int]:
+    """Run oci-delta create. Returns (duration_sec, delta_size_bytes)."""
+    if delta_path.exists():
+        delta_path.unlink()
+    log.info("Creating delta: %s → %s", old_archive.name, new_archive.name)
+    start = time.time()
+    subprocess.run(
+        [str(oci_delta_bin), "create", "--verbose",
+         str(old_archive), str(new_archive), str(delta_path)],
+        check=True,
+    )
+    duration = time.time() - start
+    size = delta_path.stat().st_size
+    log.info("Delta created: %s (%.1f MB) in %.1fs",
+             delta_path.name, size / 1024**2, duration)
+    return duration, size
+
+
+def prepare_delta_artifacts(
+    base_image: str,
+    target_image: str,
+    oci_delta_bin: Path,
+    output_dir: Path,
+) -> dict:
+    """Prepare OCI archives and delta file for a given base→target pair.
+
+    Done once per target, outside the iteration loop.
+    Returns a dict with paths and timing info.
+    """
+    archives_dir = output_dir / "archives"
+    archives_dir.mkdir(parents=True, exist_ok=True)
+
+    authfile = _find_authfile()
+
+    # Sanitize image refs for filenames
+    def safe_name(ref: str) -> str:
+        return ref.split("/")[-1].replace(":", "-")
+
+    old_archive = archives_dir / f"{safe_name(base_image)}.oci-archive"
+    new_archive = archives_dir / f"{safe_name(target_image)}.oci-archive"
+    delta_file = archives_dir / f"{safe_name(base_image)}-to-{safe_name(target_image)}.delta"
+
+    # Export both images
+    old_export_time = export_oci_archive(base_image, old_archive, authfile)
+    new_export_time = export_oci_archive(target_image, new_archive, authfile)
+
+    # Create delta
+    delta_time, delta_size = create_delta(
+        oci_delta_bin, old_archive, new_archive, delta_file
+    )
+
+    return {
+        "old_archive": str(old_archive),
+        "new_archive": str(new_archive),
+        "delta_file": str(delta_file),
+        "old_archive_size_bytes": old_archive.stat().st_size,
+        "new_archive_size_bytes": new_archive.stat().st_size,
+        "delta_size_bytes": delta_size,
+        "old_export_duration_sec": round(old_export_time, 2),
+        "new_export_duration_sec": round(new_export_time, 2),
+        "delta_create_duration_sec": round(delta_time, 2),
+    }
+
+
+def run_iteration_delta(
+    iteration_num: int,
+    base_qcow2: Path,
+    target_image: str,
+    ssh_key_path: Path,
+    vm_mgr: VMManager,
+    work_dir: Path,
+    oci_delta_bin: Path,
+    delta_artifacts: dict,
+    target_layer_info: Optional[dict] = None,
+    vm_memory_mb: int = DEFAULT_VM_MEMORY_MB,
+    vm_vcpus: int = DEFAULT_VM_VCPUS,
+) -> IterationResult:
+    """Run a single benchmark iteration using oci-delta."""
+    result = IterationResult(iteration=iteration_num, mode="delta")
+    vm_name = f"bootc-bench-delta-{iteration_num}-{uuid.uuid4().hex[:8]}"
+    disk_path = work_dir / f"{vm_name}.qcow2"
+    dom = None
+    ssh = None
+
+    delta_file = Path(delta_artifacts["delta_file"])
+    result.delta_file_size_bytes = delta_artifacts["delta_size_bytes"]
+
+    # Pre-populate layer info from pre-collected data
+    if target_layer_info:
+        result.layer_details = target_layer_info.get("layers", [])
+        result.layers_pulled = target_layer_info.get("layer_count")
+        result.download_size_bytes = delta_artifacts["delta_size_bytes"]
+
+    try:
+        # 1. Copy base qcow2
+        log.info("[Delta Iter %d] Copying base qcow2...", iteration_num)
+        subprocess.run(["sudo", "cp", str(base_qcow2), str(disk_path)], check=True)
+        subprocess.run(["sudo", "chmod", "0644", str(disk_path)], check=True)
+        subprocess.run(
+            ["sudo", "qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
+            check=True, capture_output=True,
+        )
+
+        # 2. Create and start VM
+        log.info("[Delta Iter %d] Starting VM %s...", iteration_num, vm_name)
+        dom = vm_mgr.create_vm(vm_name, str(disk_path),
+                               memory_mb=vm_memory_mb, vcpus=vm_vcpus)
+
+        # 3. Get VM IP and connect via SSH
+        vm_ip = vm_mgr.get_vm_ip(dom)
+        ssh = SSH(vm_ip, str(ssh_key_path))
+        ssh.connect()
+
+        # 4. Pre-upgrade baseline
+        log.info("[Delta Iter %d] Collecting pre-upgrade baseline...", iteration_num)
+        result.pre_upgrade = {
+            "bootc_status": collect_bootc_status(ssh),
+            "disk_usage": collect_disk_usage(ssh),
+        }
+
+        # 5. Start resource monitor
+        monitor = ResourceMonitor(vm_mgr, dom)
+        monitor.start()
+
+        # 6. Transfer delta file + oci-delta binary into VM
+        log.info("[Delta Iter %d] Transferring delta (%.1f MB) and oci-delta binary...",
+                 iteration_num, delta_file.stat().st_size / 1024**2)
+        transfer_start = time.time()
+        transfer_start_ts = datetime.now().isoformat()
+
+        ssh.upload_file(str(delta_file), "/tmp/update.delta")
+        ssh.upload_file(str(oci_delta_bin), "/tmp/oci-delta")
+        ssh.run("chmod +x /tmp/oci-delta")
+
+        transfer_end = time.time()
+        transfer_duration = transfer_end - transfer_start
+
+        result.delta_transfer_phase = PhaseResult(
+            name="delta_transfer",
+            duration_sec=round(transfer_duration, 2),
+            start_time=transfer_start_ts,
+            end_time=datetime.now().isoformat(),
+        )
+        log.info("[Delta Iter %d] Transfer completed in %.1fs",
+                 iteration_num, transfer_duration)
+
+        # 7. Apply delta → reconstruct OCI archive
+        log.info("[Delta Iter %d] Applying delta...", iteration_num)
+        apply_start = time.time()
+        apply_start_ts = datetime.now().isoformat()
+
+        rc, out, err = ssh.run(
+            "bash -c 'set -o pipefail; /tmp/oci-delta apply "
+            "/tmp/update.delta /tmp/new.oci-archive 2>&1 | cat'",
+            timeout=1800,
+        )
+
+        apply_end = time.time()
+        apply_duration = apply_end - apply_start
+
+        result.delta_apply_phase = PhaseResult(
+            name="delta_apply",
+            duration_sec=round(apply_duration, 2),
+            start_time=apply_start_ts,
+            end_time=datetime.now().isoformat(),
+        )
+        result.delta_apply_output = out
+
+        if rc != 0:
+            result.error = f"oci-delta apply failed (rc={rc}): {out}"
+            log.error("[Delta Iter %d] %s", iteration_num, result.error)
+            monitor.stop()
+            return result
+
+        log.info("[Delta Iter %d] Delta apply completed in %.1fs",
+                 iteration_num, apply_duration)
+
+        # 8. Stage phase: bootc switch to local OCI archive
+        log.info("[Delta Iter %d] Running bootc switch (oci-archive)...", iteration_num)
+        stage_start = time.time()
+        stage_start_ts = datetime.now().isoformat()
+
+        rc, out, err = ssh.run(
+            "bash -c 'set -o pipefail; bootc switch "
+            "--transport=oci-archive /tmp/new.oci-archive 2>&1 | cat'",
+            timeout=1800,
+        )
+
+        stage_end = time.time()
+        stage_duration = stage_end - stage_start
+
+        result.stage_phase = PhaseResult(
+            name="stage",
+            duration_sec=round(stage_duration, 2),
+            start_time=stage_start_ts,
+            end_time=datetime.now().isoformat(),
+        )
+        result.bootc_switch_output = out
+
+        parsed = parse_bootc_switch_output(out)
+        result.bootc_parsed = parsed
+
+        if rc != 0:
+            result.error = f"bootc switch failed (rc={rc}): {out}"
+            log.error("[Delta Iter %d] %s", iteration_num, result.error)
+            monitor.stop()
+            return result
+
+        log.info("[Delta Iter %d] Stage phase completed in %.1fs",
+                 iteration_num, stage_duration)
+
+        # 9. Reboot phase
+        log.info("[Delta Iter %d] Rebooting VM...", iteration_num)
+        reboot_start = time.time()
+        reboot_start_ts = datetime.now().isoformat()
+
+        ssh.run("systemctl reboot", timeout=10)
+        ssh.close()
+
+        wait_for_ssh_down(vm_ip)
+        time.sleep(5)
+
+        ssh = SSH(vm_ip, str(ssh_key_path))
+        ssh.connect(timeout=SSH_TIMEOUT_SEC)
+
+        reboot_end = time.time()
+        reboot_duration = reboot_end - reboot_start
+
+        result.reboot_phase = PhaseResult(
+            name="reboot",
+            duration_sec=round(reboot_duration, 2),
+            start_time=reboot_start_ts,
+            end_time=datetime.now().isoformat(),
+        )
+        log.info("[Delta Iter %d] Reboot completed in %.1fs",
+                 iteration_num, reboot_duration)
+
+        # 10. Post-upgrade stats
+        log.info("[Delta Iter %d] Collecting post-upgrade stats...", iteration_num)
+        result.post_upgrade = {
+            "bootc_status": collect_bootc_status(ssh),
+            "disk_usage": collect_disk_usage(ssh),
+        }
+
+        pre_used = result.pre_upgrade.get("disk_usage", {}).get("used_bytes", 0)
+        post_used = result.post_upgrade.get("disk_usage", {}).get("used_bytes", 0)
+        if pre_used and post_used:
+            result.disk_delta_bytes = post_used - pre_used
+
+        # Total = transfer + apply + stage + reboot
+        result.total_duration_sec = round(
+            transfer_duration + apply_duration + stage_duration + reboot_duration, 2
+        )
+
+        # Stop monitor
+        samples = monitor.stop()
+        result.cpu_samples = [asdict(s) for s in samples]
+        result.memory_samples = [
+            {"timestamp": s.timestamp, "rss_kb": s.memory_rss_kb,
+             "available_kb": s.memory_available_kb}
+            for s in samples
+        ]
+
+        log.info(
+            "[Delta Iter %d] Complete — transfer=%.1fs apply=%.1fs "
+            "stage=%.1fs reboot=%.1fs total=%.1fs",
+            iteration_num, transfer_duration, apply_duration,
+            stage_duration, reboot_duration, result.total_duration_sec,
+        )
+
+    except Exception as e:
+        result.error = str(e)
+        log.error("[Delta Iter %d] Failed: %s", iteration_num, e, exc_info=True)
+
+    finally:
+        if ssh:
+            ssh.close()
+        if dom:
+            vm_mgr.destroy_vm(dom)
+        if disk_path.exists():
+            subprocess.run(["sudo", "rm", "-f", str(disk_path)], check=False)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Summary statistics
 # ---------------------------------------------------------------------------
 
@@ -1012,6 +1363,17 @@ def compute_summary(results: list[IterationResult]) -> dict:
     if disk_deltas:
         summary["disk_delta_bytes"] = stat(disk_deltas)
 
+    # Delta-mode phases
+    transfer_times = [r.delta_transfer_phase.duration_sec for r in successful
+                      if r.delta_transfer_phase]
+    if transfer_times:
+        summary["delta_transfer_duration_sec"] = stat(transfer_times)
+
+    apply_times = [r.delta_apply_phase.duration_sec for r in successful
+                   if r.delta_apply_phase]
+    if apply_times:
+        summary["delta_apply_duration_sec"] = stat(apply_times)
+
     summary["successful_iterations"] = len(successful)
     summary["failed_iterations"] = len(results) - len(successful)
 
@@ -1024,6 +1386,10 @@ def compute_summary(results: list[IterationResult]) -> dict:
 
 def run_benchmark(args) -> dict:
     """Run the full benchmark suite."""
+    # Keep sudo credentials alive throughout the run
+    sudo_keepalive = SudoKeepalive()
+    sudo_keepalive.start()
+
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1054,6 +1420,13 @@ def run_benchmark(args) -> dict:
     vm_mgr = VMManager(uri=args.libvirt_uri)
     vm_mgr.connect()
 
+    mode = getattr(args, "mode", "baseline")
+    oci_delta_bin = None
+    if mode == "delta":
+        oci_delta_bin = Path(args.oci_delta_bin).resolve()
+        if not oci_delta_bin.exists():
+            raise FileNotFoundError(f"oci-delta binary not found: {oci_delta_bin}")
+
     all_results = {
         "config": {
             "base_image": base_image,
@@ -1061,6 +1434,7 @@ def run_benchmark(args) -> dict:
             "iterations": args.iterations,
             "vm_memory_mb": args.vm_memory,
             "vm_vcpus": args.vm_vcpus,
+            "mode": mode,
             "timestamp": datetime.now().isoformat(),
         },
         "benchmarks": [],
@@ -1069,7 +1443,8 @@ def run_benchmark(args) -> dict:
     try:
         for target in targets:
             log.info("=" * 60)
-            log.info("Benchmarking upgrade: %s -> %s", base_image, target)
+            log.info("Benchmarking [%s] upgrade: %s -> %s",
+                     mode, base_image, target)
             log.info("=" * 60)
 
             # Collect layer info once per target from the host
@@ -1079,10 +1454,20 @@ def run_benchmark(args) -> dict:
                 log.warning("Could not collect layer info: %s",
                             target_layer_info["error"])
 
+            # Prepare delta artifacts if in delta mode
+            delta_artifacts = None
+            if mode == "delta":
+                log.info("Preparing delta artifacts...")
+                delta_artifacts = prepare_delta_artifacts(
+                    base_image, target, oci_delta_bin, output_dir,
+                )
+
             benchmark = {
                 "base_image": base_image,
                 "target_image": target,
                 "target_layer_info": target_layer_info,
+                "mode": mode,
+                "delta_artifacts": delta_artifacts,
                 "iterations": [],
                 "summary": {},
             }
@@ -1090,20 +1475,35 @@ def run_benchmark(args) -> dict:
             iteration_results = []
             for i in range(1, args.iterations + 1):
                 log.info("-" * 40)
-                log.info("Iteration %d/%d", i, args.iterations)
+                log.info("Iteration %d/%d [%s]", i, args.iterations, mode)
                 log.info("-" * 40)
 
-                result = run_iteration(
-                    iteration_num=i,
-                    base_qcow2=base_qcow2,
-                    target_image=target,
-                    ssh_key_path=ssh_priv,
-                    vm_mgr=vm_mgr,
-                    work_dir=work_dir,
-                    target_layer_info=target_layer_info,
-                    vm_memory_mb=args.vm_memory,
-                    vm_vcpus=args.vm_vcpus,
-                )
+                if mode == "delta":
+                    result = run_iteration_delta(
+                        iteration_num=i,
+                        base_qcow2=base_qcow2,
+                        target_image=target,
+                        ssh_key_path=ssh_priv,
+                        vm_mgr=vm_mgr,
+                        work_dir=work_dir,
+                        oci_delta_bin=oci_delta_bin,
+                        delta_artifacts=delta_artifacts,
+                        target_layer_info=target_layer_info,
+                        vm_memory_mb=args.vm_memory,
+                        vm_vcpus=args.vm_vcpus,
+                    )
+                else:
+                    result = run_iteration(
+                        iteration_num=i,
+                        base_qcow2=base_qcow2,
+                        target_image=target,
+                        ssh_key_path=ssh_priv,
+                        vm_mgr=vm_mgr,
+                        work_dir=work_dir,
+                        target_layer_info=target_layer_info,
+                        vm_memory_mb=args.vm_memory,
+                        vm_vcpus=args.vm_vcpus,
+                    )
                 iteration_results.append(result)
                 benchmark["iterations"].append(asdict(result))
 
@@ -1112,6 +1512,7 @@ def run_benchmark(args) -> dict:
 
     finally:
         vm_mgr.close()
+        sudo_keepalive.stop()
 
     # Write results
     results_file = output_dir / "results.json"
@@ -1176,6 +1577,14 @@ def main():
     parser.add_argument(
         "--vm-vcpus", type=int, default=DEFAULT_VM_VCPUS,
         help=f"VM vCPUs (default: {DEFAULT_VM_VCPUS})",
+    )
+    parser.add_argument(
+        "-m", "--mode", choices=["baseline", "delta"], default="baseline",
+        help="Benchmark mode: 'baseline' (full pull) or 'delta' (oci-delta)",
+    )
+    parser.add_argument(
+        "--oci-delta-bin", default=OCI_DELTA_BIN_DEFAULT,
+        help=f"Path to oci-delta binary (default: {OCI_DELTA_BIN_DEFAULT})",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",

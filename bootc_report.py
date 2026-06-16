@@ -3,6 +3,7 @@
 
 Reads the JSON output from bootc_bench.py and produces a self-contained
 HTML report with summary tables, timing charts, and CPU/memory time-series.
+Supports both baseline (registry pull) and delta (oci-delta) benchmark modes.
 """
 
 import argparse
@@ -49,30 +50,76 @@ def format_duration(sec: float | None) -> str:
 
 def short_image_ref(ref: str) -> str:
     """Shorten an image reference for display."""
-    # registry.redhat.io/rhel9/rhel-bootc:9.8 -> rhel-bootc:9.8
     parts = ref.rsplit("/", 1)
     return parts[-1] if len(parts) > 1 else ref
 
 
+def get_mode(bench: dict) -> str:
+    """Get the benchmark mode for a benchmark entry."""
+    return bench.get("mode", "baseline")
+
+
+def has_delta_benchmarks(data: dict) -> bool:
+    """Check if any benchmarks use delta mode."""
+    return any(get_mode(b) == "delta" for b in data["benchmarks"])
+
+
+def has_baseline_benchmarks(data: dict) -> bool:
+    """Check if any benchmarks use baseline mode."""
+    return any(get_mode(b) == "baseline" for b in data["benchmarks"])
+
+
 def build_summary_table(data: dict) -> str:
     """Build the HTML summary comparison table."""
-    config = data.get("config", {})
+    show_delta = has_delta_benchmarks(data)
     rows = []
     for bench in data["benchmarks"]:
         target = bench["target_image"]
+        mode = get_mode(bench)
         summary = bench.get("summary", {})
         layer_info = bench.get("target_layer_info", {})
+        delta_arts = bench.get("delta_artifacts") or {}
 
         stage = summary.get("stage_duration_sec", {})
         reboot = summary.get("reboot_duration_sec", {})
         total = summary.get("total_duration_sec", {})
+        transfer = summary.get("delta_transfer_duration_sec", {})
+        apply_ = summary.get("delta_apply_duration_sec", {})
 
         success = summary.get("successful_iterations", 0)
         failed = summary.get("failed_iterations", 0)
 
+        mode_badge = (
+            '<span class="badge badge-delta">delta</span>'
+            if mode == "delta"
+            else '<span class="badge badge-baseline">baseline</span>'
+        )
+
+        # Download size: for delta mode show delta size, for baseline show image size
+        if mode == "delta" and delta_arts.get("delta_size_bytes"):
+            dl_size = format_bytes(delta_arts["delta_size_bytes"])
+        else:
+            dl_size = format_bytes(layer_info.get("total_compressed_size_bytes"))
+
+        # Delta-specific columns
+        delta_cols = ""
+        if show_delta:
+            if mode == "delta":
+                delta_cols = f"""
+            <td>{format_duration(transfer.get('mean'))}<br>
+                <small>±{transfer.get('stddev', 0):.1f}s</small></td>
+            <td>{format_duration(apply_.get('mean'))}<br>
+                <small>±{apply_.get('stddev', 0):.1f}s</small></td>"""
+            else:
+                delta_cols = """
+            <td class="na">—</td>
+            <td class="na">—</td>"""
+
         rows.append(f"""
         <tr>
             <td>{html.escape(short_image_ref(target))}</td>
+            <td>{mode_badge}</td>
+            {delta_cols}
             <td>{format_duration(stage.get('mean'))}<br>
                 <small>±{stage.get('stddev', 0):.1f}s</small></td>
             <td>{format_duration(reboot.get('mean'))}<br>
@@ -80,15 +127,23 @@ def build_summary_table(data: dict) -> str:
             <td>{format_duration(total.get('mean'))}<br>
                 <small>±{total.get('stddev', 0):.1f}s</small></td>
             <td>{layer_info.get('layer_count', 'N/A')}</td>
-            <td>{format_bytes(layer_info.get('total_compressed_size_bytes'))}</td>
+            <td>{dl_size}</td>
             <td>{success}/{success + failed}</td>
         </tr>""")
+
+    delta_headers = ""
+    if show_delta:
+        delta_headers = """
+                <th>Transfer (mean)</th>
+                <th>Apply (mean)</th>"""
 
     return f"""
     <table>
         <thead>
             <tr>
                 <th>Target</th>
+                <th>Mode</th>
+                {delta_headers}
                 <th>Stage (mean)</th>
                 <th>Reboot (mean)</th>
                 <th>Total (mean)</th>
@@ -103,17 +158,69 @@ def build_summary_table(data: dict) -> str:
     </table>"""
 
 
+def build_delta_artifacts_section(bench: dict) -> str:
+    """Build a section showing delta preparation artifacts."""
+    delta_arts = bench.get("delta_artifacts")
+    if not delta_arts:
+        return ""
+
+    old_size = delta_arts.get("old_archive_size_bytes", 0)
+    new_size = delta_arts.get("new_archive_size_bytes", 0)
+    delta_size = delta_arts.get("delta_size_bytes", 0)
+    ratio = (delta_size / new_size * 100) if new_size else 0
+    savings = new_size - delta_size if new_size and delta_size else 0
+
+    return f"""
+    <div class="artifacts-box">
+        <h4>Delta Artifacts</h4>
+        <div class="artifacts-grid">
+            <div class="artifact-item">
+                <span class="artifact-label">Base Archive</span>
+                <span class="artifact-value">{format_bytes(old_size)}</span>
+                <small>{format_duration(delta_arts.get('old_export_duration_sec'))} to export</small>
+            </div>
+            <div class="artifact-item">
+                <span class="artifact-label">Target Archive</span>
+                <span class="artifact-value">{format_bytes(new_size)}</span>
+                <small>{format_duration(delta_arts.get('new_export_duration_sec'))} to export</small>
+            </div>
+            <div class="artifact-item highlight">
+                <span class="artifact-label">Delta File</span>
+                <span class="artifact-value">{format_bytes(delta_size)}</span>
+                <small>{format_duration(delta_arts.get('delta_create_duration_sec'))} to create</small>
+            </div>
+            <div class="artifact-item">
+                <span class="artifact-label">Compression Ratio</span>
+                <span class="artifact-value">{ratio:.1f}%</span>
+                <small>{format_bytes(savings)} saved vs full image</small>
+            </div>
+        </div>
+    </div>"""
+
+
 def build_iteration_table(bench: dict) -> str:
     """Build a per-iteration detail table for a single target."""
+    mode = get_mode(bench)
+    is_delta = mode == "delta"
     rows = []
     for it in bench.get("iterations", []):
-        stage = it.get("stage_phase", {})
-        reboot = it.get("reboot_phase", {})
-        parsed = it.get("bootc_parsed", {})
+        stage = it.get("stage_phase") or {}
+        reboot = it.get("reboot_phase") or {}
+        parsed = it.get("bootc_parsed") or {}
+
+        delta_cols = ""
+        if is_delta:
+            transfer = it.get("delta_transfer_phase") or {}
+            apply_ = it.get("delta_apply_phase") or {}
+            delta_cols = f"""
+            <td>{format_duration(transfer.get('duration_sec'))}</td>
+            <td>{format_duration(apply_.get('duration_sec'))}</td>
+            <td>{format_bytes(it.get('delta_file_size_bytes'))}</td>"""
 
         rows.append(f"""
         <tr>
             <td>{it.get('iteration', '?')}</td>
+            {delta_cols}
             <td>{format_duration(stage.get('duration_sec'))}</td>
             <td>{format_duration(reboot.get('duration_sec'))}</td>
             <td>{format_duration(it.get('total_duration_sec'))}</td>
@@ -123,11 +230,19 @@ def build_iteration_table(bench: dict) -> str:
             <td>{'✅' if it.get('error') is None else '❌'}</td>
         </tr>""")
 
+    delta_headers = ""
+    if is_delta:
+        delta_headers = """
+                <th>Transfer</th>
+                <th>Apply</th>
+                <th>Delta Size</th>"""
+
     return f"""
     <table>
         <thead>
             <tr>
                 <th>Iter</th>
+                {delta_headers}
                 <th>Stage</th>
                 <th>Reboot</th>
                 <th>Total</th>
@@ -148,35 +263,58 @@ def build_chart_data(data: dict) -> dict:
     charts = {
         "timing_comparison": {
             "labels": [],
+            "modes": [],
             "stage_means": [],
             "stage_errs": [],
             "reboot_means": [],
             "reboot_errs": [],
+            "transfer_means": [],
+            "transfer_errs": [],
+            "apply_means": [],
+            "apply_errs": [],
         },
         "per_target": {},
     }
 
     for bench in data["benchmarks"]:
+        mode = get_mode(bench)
         label = short_image_ref(bench["target_image"])
+        if mode == "delta":
+            label += " (delta)"
         summary = bench.get("summary", {})
         stage = summary.get("stage_duration_sec", {})
         reboot = summary.get("reboot_duration_sec", {})
+        transfer = summary.get("delta_transfer_duration_sec", {})
+        apply_ = summary.get("delta_apply_duration_sec", {})
 
         charts["timing_comparison"]["labels"].append(label)
+        charts["timing_comparison"]["modes"].append(mode)
         charts["timing_comparison"]["stage_means"].append(stage.get("mean", 0))
         charts["timing_comparison"]["stage_errs"].append(stage.get("stddev", 0))
         charts["timing_comparison"]["reboot_means"].append(reboot.get("mean", 0))
         charts["timing_comparison"]["reboot_errs"].append(reboot.get("stddev", 0))
+        charts["timing_comparison"]["transfer_means"].append(transfer.get("mean", 0))
+        charts["timing_comparison"]["transfer_errs"].append(transfer.get("stddev", 0))
+        charts["timing_comparison"]["apply_means"].append(apply_.get("mean", 0))
+        charts["timing_comparison"]["apply_errs"].append(apply_.get("stddev", 0))
 
-        # Per-iteration timing for scatter/line
-        iter_data = {"stages": [], "reboots": [], "totals": [], "iters": []}
+        # Per-iteration timing
+        iter_data = {
+            "mode": mode,
+            "stages": [], "reboots": [], "totals": [], "iters": [],
+            "transfers": [], "applies": [],
+        }
         for it in bench.get("iterations", []):
-            sp = it.get("stage_phase", {})
-            rp = it.get("reboot_phase", {})
+            sp = it.get("stage_phase") or {}
+            rp = it.get("reboot_phase") or {}
+            tp = it.get("delta_transfer_phase") or {}
+            ap = it.get("delta_apply_phase") or {}
             iter_data["iters"].append(it.get("iteration", 0))
             iter_data["stages"].append(sp.get("duration_sec", 0))
             iter_data["reboots"].append(rp.get("duration_sec", 0))
             iter_data["totals"].append(it.get("total_duration_sec", 0))
+            iter_data["transfers"].append(tp.get("duration_sec", 0))
+            iter_data["applies"].append(ap.get("duration_sec", 0))
 
         # CPU/memory time series from first successful iteration
         cpu_ts = []
@@ -203,6 +341,24 @@ def build_chart_data(data: dict) -> dict:
         iter_data["mem_ts"] = mem_ts
         charts["per_target"][label] = iter_data
 
+    # Delta size comparison data (for delta benchmarks)
+    delta_size_data = {"labels": [], "full_sizes": [], "delta_sizes": []}
+    for bench in data["benchmarks"]:
+        if get_mode(bench) != "delta":
+            continue
+        delta_arts = bench.get("delta_artifacts") or {}
+        if not delta_arts:
+            continue
+        label = short_image_ref(bench["target_image"])
+        delta_size_data["labels"].append(label)
+        delta_size_data["full_sizes"].append(
+            round(delta_arts.get("new_archive_size_bytes", 0) / 1024**2, 1)
+        )
+        delta_size_data["delta_sizes"].append(
+            round(delta_arts.get("delta_size_bytes", 0) / 1024**2, 1)
+        )
+    charts["delta_size"] = delta_size_data
+
     return charts
 
 
@@ -210,21 +366,28 @@ def generate_html(data: dict) -> str:
     """Generate the full HTML report."""
     config = data.get("config", {})
     chart_data = build_chart_data(data)
+    show_delta = has_delta_benchmarks(data)
+    mode = config.get("mode", "baseline")
 
     # Build per-target detail sections
     target_sections = []
     for bench in data["benchmarks"]:
+        bench_mode = get_mode(bench)
         label = short_image_ref(bench["target_image"])
-        safe_id = label.replace(":", "-").replace("/", "-")
+        chart_label = label + (" (delta)" if bench_mode == "delta" else "")
+        safe_id = chart_label.replace(":", "-").replace("/", "-").replace(" ", "-").replace("(", "").replace(")", "")
         iter_table = build_iteration_table(bench)
 
-        # Error details if any
+        # Delta artifacts
+        artifacts_html = build_delta_artifacts_section(bench)
+
+        # Error details
         errors = []
         for it in bench.get("iterations", []):
             if it.get("error"):
                 errors.append(
                     f"<li>Iteration {it['iteration']}: "
-                    f"<code>{html.escape(it['error'])}</code></li>"
+                    f"<code>{html.escape(str(it['error']))}</code></li>"
                 )
         error_html = ""
         if errors:
@@ -234,9 +397,16 @@ def generate_html(data: dict) -> str:
                 <ul>{''.join(errors)}</ul>
             </div>"""
 
+        mode_badge = (
+            '<span class="badge badge-delta">delta</span>'
+            if bench_mode == "delta"
+            else '<span class="badge badge-baseline">baseline</span>'
+        )
+
         target_sections.append(f"""
         <div class="target-section" id="target-{safe_id}">
-            <h3>→ {html.escape(label)}</h3>
+            <h3>→ {html.escape(label)} {mode_badge}</h3>
+            {artifacts_html}
             {error_html}
             {iter_table}
             <div class="chart-row">
@@ -250,6 +420,19 @@ def generate_html(data: dict) -> str:
         </div>""")
 
     summary_table = build_summary_table(data)
+
+    # Delta size chart section
+    delta_size_chart_html = ""
+    if show_delta:
+        delta_size_chart_html = """
+        <div class="main-chart">
+            <canvas id="delta-size-chart"></canvas>
+        </div>"""
+
+    mode_desc = {
+        "baseline": "Registry Pull (baseline)",
+        "delta": "OCI Delta",
+    }.get(mode, mode)
 
     return textwrap.dedent(f"""\
     <!DOCTYPE html>
@@ -271,6 +454,7 @@ def generate_html(data: dict) -> str:
                 --orange: #d29922;
                 --red: #f85149;
                 --purple: #bc8cff;
+                --cyan: #39d2c0;
             }}
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
@@ -285,6 +469,7 @@ def generate_html(data: dict) -> str:
             h1 {{ color: var(--accent); margin-bottom: 0.5rem; }}
             h2 {{ color: var(--text); margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }}
             h3 {{ color: var(--accent); margin: 1.5rem 0 0.75rem; }}
+            h4 {{ color: var(--text-muted); margin: 0.75rem 0 0.5rem; font-size: 0.95rem; }}
             .subtitle {{ color: var(--text-muted); margin-bottom: 2rem; }}
             .config-box {{
                 background: var(--surface);
@@ -295,6 +480,26 @@ def generate_html(data: dict) -> str:
                 font-size: 0.9rem;
             }}
             .config-box code {{ color: var(--accent); }}
+            .badge {{
+                display: inline-block;
+                padding: 0.15em 0.55em;
+                border-radius: 10px;
+                font-size: 0.75rem;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                vertical-align: middle;
+            }}
+            .badge-baseline {{
+                background: rgba(88, 166, 255, 0.15);
+                color: var(--accent);
+                border: 1px solid rgba(88, 166, 255, 0.3);
+            }}
+            .badge-delta {{
+                background: rgba(57, 210, 192, 0.15);
+                color: var(--cyan);
+                border: 1px solid rgba(57, 210, 192, 0.3);
+            }}
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -318,6 +523,7 @@ def generate_html(data: dict) -> str:
             }}
             td {{ font-size: 0.95rem; }}
             td small {{ color: var(--text-muted); }}
+            td.na {{ color: var(--text-muted); text-align: center; }}
             tr:last-child td {{ border-bottom: none; }}
             tr:hover td {{ background: rgba(255, 255, 255, 0.03); }}
             .chart-row {{
@@ -347,11 +553,53 @@ def generate_html(data: dict) -> str:
                 margin: 0.5rem 0;
                 font-size: 0.9rem;
             }}
-            .error-box code {{ color: var(--red); font-size: 0.85rem; }}
+            .error-box code {{ color: var(--red); font-size: 0.85rem; word-break: break-all; }}
             .target-section {{
                 margin-bottom: 2rem;
                 padding-bottom: 2rem;
                 border-bottom: 1px solid var(--border);
+            }}
+            .artifacts-box {{
+                background: var(--surface);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 1rem 1.5rem;
+                margin: 1rem 0;
+            }}
+            .artifacts-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 1rem;
+                margin-top: 0.75rem;
+            }}
+            .artifact-item {{
+                display: flex;
+                flex-direction: column;
+                padding: 0.75rem;
+                border-radius: 6px;
+                background: rgba(255, 255, 255, 0.02);
+                border: 1px solid var(--border);
+            }}
+            .artifact-item.highlight {{
+                background: rgba(57, 210, 192, 0.08);
+                border-color: rgba(57, 210, 192, 0.3);
+            }}
+            .artifact-label {{
+                font-size: 0.8rem;
+                color: var(--text-muted);
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                margin-bottom: 0.25rem;
+            }}
+            .artifact-value {{
+                font-size: 1.25rem;
+                font-weight: 600;
+                color: var(--text);
+            }}
+            .artifact-item small {{
+                color: var(--text-muted);
+                font-size: 0.8rem;
+                margin-top: 0.25rem;
             }}
             .footer {{
                 margin-top: 3rem;
@@ -362,6 +610,7 @@ def generate_html(data: dict) -> str:
             }}
             @media (max-width: 768px) {{
                 .chart-row {{ grid-template-columns: 1fr; }}
+                .artifacts-grid {{ grid-template-columns: 1fr 1fr; }}
                 body {{ padding: 1rem; }}
             }}
         </style>
@@ -372,6 +621,7 @@ def generate_html(data: dict) -> str:
 
         <div class="config-box">
             <strong>Base image:</strong> <code>{html.escape(config.get('base_image', 'N/A'))}</code><br>
+            <strong>Mode:</strong> <span class="badge badge-{'delta' if mode == 'delta' else 'baseline'}">{mode}</span><br>
             <strong>Iterations:</strong> {config.get('iterations', 'N/A')} per target<br>
             <strong>VM:</strong> {config.get('vm_vcpus', '?')} vCPUs, {config.get('vm_memory_mb', '?')} MB RAM<br>
             <strong>Run date:</strong> {config.get('timestamp', 'N/A')[:19]}
@@ -384,6 +634,8 @@ def generate_html(data: dict) -> str:
             <canvas id="timing-comparison-chart"></canvas>
         </div>
 
+        {delta_size_chart_html}
+
         <h2>Per-Target Details</h2>
         {''.join(target_sections)}
 
@@ -394,84 +646,123 @@ def generate_html(data: dict) -> str:
 
         <script>
         const chartData = {json.dumps(chart_data)};
+        const hasDelta = {json.dumps(show_delta)};
 
         Chart.defaults.color = '#8b949e';
         Chart.defaults.borderColor = '#30363d';
 
         // --- Main timing comparison bar chart ---
-        new Chart(document.getElementById('timing-comparison-chart'), {{
-            type: 'bar',
-            data: {{
-                labels: chartData.timing_comparison.labels,
-                datasets: [
-                    {{
-                        label: 'Stage (pull + deploy)',
-                        data: chartData.timing_comparison.stage_means,
-                        backgroundColor: 'rgba(88, 166, 255, 0.7)',
-                        borderColor: 'rgba(88, 166, 255, 1)',
-                        borderWidth: 1,
-                    }},
-                    {{
-                        label: 'Reboot',
-                        data: chartData.timing_comparison.reboot_means,
-                        backgroundColor: 'rgba(63, 185, 80, 0.7)',
-                        borderColor: 'rgba(63, 185, 80, 1)',
-                        borderWidth: 1,
-                    }}
-                ]
-            }},
-            options: {{
-                responsive: true,
-                plugins: {{
-                    title: {{
-                        display: true,
-                        text: 'Upgrade Timing Comparison (mean)',
-                        color: '#e6edf3',
-                        font: {{ size: 16 }}
-                    }},
-                    tooltip: {{
-                        callbacks: {{
-                            afterLabel: function(ctx) {{
-                                const errs = ctx.datasetIndex === 0
-                                    ? chartData.timing_comparison.stage_errs
-                                    : chartData.timing_comparison.reboot_errs;
-                                return '±' + errs[ctx.dataIndex].toFixed(1) + 's';
-                            }}
-                        }}
-                    }}
-                }},
-                scales: {{
-                    x: {{ stacked: true }},
-                    y: {{
-                        stacked: true,
-                        title: {{ display: true, text: 'Duration (seconds)' }}
-                    }}
-                }}
+        (() => {{
+            const datasets = [];
+
+            // If any delta benchmarks exist, show transfer + apply phases
+            const hasAnyTransfer = chartData.timing_comparison.transfer_means.some(v => v > 0);
+            const hasAnyApply = chartData.timing_comparison.apply_means.some(v => v > 0);
+
+            if (hasAnyTransfer) {{
+                datasets.push({{
+                    label: 'Transfer (delta)',
+                    data: chartData.timing_comparison.transfer_means,
+                    backgroundColor: 'rgba(57, 210, 192, 0.7)',
+                    borderColor: 'rgba(57, 210, 192, 1)',
+                    borderWidth: 1,
+                }});
             }}
-        }});
+            if (hasAnyApply) {{
+                datasets.push({{
+                    label: 'Apply (delta)',
+                    data: chartData.timing_comparison.apply_means,
+                    backgroundColor: 'rgba(210, 153, 34, 0.7)',
+                    borderColor: 'rgba(210, 153, 34, 1)',
+                    borderWidth: 1,
+                }});
+            }}
 
-        // --- Per-target charts ---
-        for (const [label, tdata] of Object.entries(chartData.per_target)) {{
-            const safeId = label.replace(':', '-').replace('/', '-');
+            datasets.push(
+                {{
+                    label: 'Stage (pull + deploy)',
+                    data: chartData.timing_comparison.stage_means,
+                    backgroundColor: 'rgba(88, 166, 255, 0.7)',
+                    borderColor: 'rgba(88, 166, 255, 1)',
+                    borderWidth: 1,
+                }},
+                {{
+                    label: 'Reboot',
+                    data: chartData.timing_comparison.reboot_means,
+                    backgroundColor: 'rgba(63, 185, 80, 0.7)',
+                    borderColor: 'rgba(63, 185, 80, 1)',
+                    borderWidth: 1,
+                }}
+            );
 
-            // Iteration timing chart
-            new Chart(document.getElementById('iter-chart-' + safeId), {{
+            new Chart(document.getElementById('timing-comparison-chart'), {{
                 type: 'bar',
                 data: {{
-                    labels: tdata.iters.map(i => 'Iter ' + i),
+                    labels: chartData.timing_comparison.labels,
+                    datasets: datasets,
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{
+                        title: {{
+                            display: true,
+                            text: 'Upgrade Timing Comparison (mean)',
+                            color: '#e6edf3',
+                            font: {{ size: 16 }},
+                        }},
+                        tooltip: {{
+                            callbacks: {{
+                                afterLabel: function(ctx) {{
+                                    const errArrays = [
+                                        chartData.timing_comparison.transfer_errs,
+                                        chartData.timing_comparison.apply_errs,
+                                        chartData.timing_comparison.stage_errs,
+                                        chartData.timing_comparison.reboot_errs,
+                                    ];
+                                    // Map dataset index to the right error array
+                                    // datasets are: [transfer?], [apply?], stage, reboot
+                                    let errIdx = ctx.datasetIndex;
+                                    if (!hasAnyTransfer) errIdx += 1;
+                                    if (!hasAnyApply) errIdx += 1;
+                                    const errs = errArrays[errIdx];
+                                    if (errs) {{
+                                        return '±' + errs[ctx.dataIndex].toFixed(1) + 's';
+                                    }}
+                                    return '';
+                                }}
+                            }}
+                        }}
+                    }},
+                    scales: {{
+                        x: {{ stacked: true }},
+                        y: {{
+                            stacked: true,
+                            title: {{ display: true, text: 'Duration (seconds)' }},
+                        }}
+                    }}
+                }}
+            }});
+        }})();
+
+        // --- Delta size comparison chart ---
+        if (hasDelta && chartData.delta_size && chartData.delta_size.labels.length > 0) {{
+            new Chart(document.getElementById('delta-size-chart'), {{
+                type: 'bar',
+                data: {{
+                    labels: chartData.delta_size.labels,
                     datasets: [
                         {{
-                            label: 'Stage',
-                            data: tdata.stages,
-                            backgroundColor: 'rgba(88, 166, 255, 0.7)',
+                            label: 'Full Image (MB)',
+                            data: chartData.delta_size.full_sizes,
+                            backgroundColor: 'rgba(88, 166, 255, 0.5)',
                             borderColor: 'rgba(88, 166, 255, 1)',
                             borderWidth: 1,
                         }},
                         {{
-                            label: 'Reboot',
-                            data: tdata.reboots,
-                            backgroundColor: 'rgba(63, 185, 80, 0.7)',
-                            borderColor: 'rgba(63, 185, 80, 1)',
+                            label: 'Delta File (MB)',
+                            data: chartData.delta_size.delta_sizes,
+                            backgroundColor: 'rgba(57, 210, 192, 0.5)',
+                            borderColor: 'rgba(57, 210, 192, 1)',
                             borderWidth: 1,
                         }}
                     ]
@@ -481,23 +772,98 @@ def generate_html(data: dict) -> str:
                     plugins: {{
                         title: {{
                             display: true,
-                            text: 'Per-Iteration Timing',
+                            text: 'Delta vs Full Image Size',
                             color: '#e6edf3',
+                            font: {{ size: 16 }},
                         }}
                     }},
                     scales: {{
-                        x: {{ stacked: true }},
                         y: {{
-                            stacked: true,
-                            title: {{ display: true, text: 'Seconds' }}
+                            title: {{ display: true, text: 'Size (MB)' }},
                         }}
                     }}
                 }}
             }});
+        }}
 
-            // Memory time series (from first successful iteration)
-            if (tdata.mem_ts && tdata.mem_ts.length > 0) {{
-                new Chart(document.getElementById('mem-chart-' + safeId), {{
+        // --- Per-target charts ---
+        for (const [label, tdata] of Object.entries(chartData.per_target)) {{
+            const safeId = label.replace(/:/g, '-').replace(/\\//g, '-')
+                               .replace(/ /g, '-').replace(/[()]/g, '');
+            const isDelta = tdata.mode === 'delta';
+
+            // Iteration timing chart
+            const iterDatasets = [];
+            const hasTransfers = tdata.transfers && tdata.transfers.some(v => v > 0);
+            const hasApplies = tdata.applies && tdata.applies.some(v => v > 0);
+
+            if (isDelta && hasTransfers) {{
+                iterDatasets.push({{
+                    label: 'Transfer',
+                    data: tdata.transfers,
+                    backgroundColor: 'rgba(57, 210, 192, 0.7)',
+                    borderColor: 'rgba(57, 210, 192, 1)',
+                    borderWidth: 1,
+                }});
+            }}
+            if (isDelta && hasApplies) {{
+                iterDatasets.push({{
+                    label: 'Apply',
+                    data: tdata.applies,
+                    backgroundColor: 'rgba(210, 153, 34, 0.7)',
+                    borderColor: 'rgba(210, 153, 34, 1)',
+                    borderWidth: 1,
+                }});
+            }}
+            iterDatasets.push(
+                {{
+                    label: 'Stage',
+                    data: tdata.stages,
+                    backgroundColor: 'rgba(88, 166, 255, 0.7)',
+                    borderColor: 'rgba(88, 166, 255, 1)',
+                    borderWidth: 1,
+                }},
+                {{
+                    label: 'Reboot',
+                    data: tdata.reboots,
+                    backgroundColor: 'rgba(63, 185, 80, 0.7)',
+                    borderColor: 'rgba(63, 185, 80, 1)',
+                    borderWidth: 1,
+                }}
+            );
+
+            const iterCanvas = document.getElementById('iter-chart-' + safeId);
+            if (iterCanvas) {{
+                new Chart(iterCanvas, {{
+                    type: 'bar',
+                    data: {{
+                        labels: tdata.iters.map(i => 'Iter ' + i),
+                        datasets: iterDatasets,
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Per-Iteration Timing',
+                                color: '#e6edf3',
+                            }}
+                        }},
+                        scales: {{
+                            x: {{ stacked: true }},
+                            y: {{
+                                stacked: true,
+                                title: {{ display: true, text: 'Seconds' }},
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+
+            // Memory time series
+            const memCanvas = document.getElementById('mem-chart-' + safeId);
+            if (memCanvas && tdata.mem_ts && tdata.mem_ts.length > 0) {{
+                new Chart(memCanvas, {{
                     type: 'line',
                     data: {{
                         datasets: [{{
@@ -522,10 +888,10 @@ def generate_html(data: dict) -> str:
                         scales: {{
                             x: {{
                                 type: 'linear',
-                                title: {{ display: true, text: 'Time (seconds)' }}
+                                title: {{ display: true, text: 'Time (seconds)' }},
                             }},
                             y: {{
-                                title: {{ display: true, text: 'RSS (MB)' }}
+                                title: {{ display: true, text: 'RSS (MB)' }},
                             }}
                         }}
                     }}
