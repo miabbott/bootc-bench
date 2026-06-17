@@ -1073,6 +1073,160 @@ def safe_name(ref: str) -> str:
     return ref.split("/")[-1].replace(":", "-")
 
 
+def _create_blob_supplement(
+    delta_file: Path,
+    target_archive: Path,
+    supplement_path: Path,
+) -> list[str]:
+    """Find blobs that oci-delta skips and extract them from the target archive.
+
+    oci-delta skips layers that are byte-identical between old and new images.
+    The apply step then produces an incomplete archive.  This function
+    identifies the missing blobs by comparing the delta's layer list against
+    the target manifest and extracts them into a small supplement tar.
+
+    Returns a list of missing blob digests (empty if none are skipped).
+    """
+    import tarfile as _tarfile
+
+    # 1. Read target manifest to get all required blob digests
+    with _tarfile.open(str(target_archive)) as tgt:
+        idx = json.load(tgt.extractfile("index.json"))
+        manifest_path = idx["manifests"][0]["digest"].replace(
+            "sha256:", "blobs/sha256/"
+        )
+        manifest = json.load(tgt.extractfile(manifest_path))
+        required = {}  # digest -> blob path
+        required[manifest["config"]["digest"]] = manifest["config"]["digest"].replace(
+            "sha256:", "blobs/sha256/"
+        )
+        for layer in manifest["layers"]:
+            required[layer["digest"]] = layer["digest"].replace(
+                "sha256:", "blobs/sha256/"
+            )
+
+    # 2. Read delta manifest to find which target digests it covers.
+    #    Each delta layer has an annotation with the target layer digest
+    #    it will reconstruct, or it's a copy of the original blob.
+    with _tarfile.open(str(delta_file)) as dtf:
+        didx = json.load(dtf.extractfile("index.json"))
+        dmanifest_path = didx["manifests"][0]["digest"].replace(
+            "sha256:", "blobs/sha256/"
+        )
+        dmanifest = json.load(dtf.extractfile(dmanifest_path))
+
+        # Collect digests the delta covers:
+        # - tar-diff layers: the annotation 'io.github.containers.delta.to'
+        #   gives the target compressed digest
+        # - original-copy layers: the blob digest IS the target digest
+        # - config/manifest entries: marked with delta.content annotations
+        covered = set()
+        delta_blob_names = set(dtf.getnames())
+
+        for layer in dmanifest["layers"]:
+            ann = layer.get("annotations", {})
+            content_type = ann.get("io.github.containers.delta.content", "")
+
+            if content_type == "image-config":
+                # The delta stores the target config directly
+                covered.add(manifest["config"]["digest"])
+            elif content_type == "image-manifest":
+                # Not a blob we need in the output
+                pass
+            elif content_type == "image-layer":
+                # tar-diff: the 'to' annotation has the OLD compressed digest,
+                # but the reconstructed layer gets a NEW digest after
+                # decompression + recompression.  The delta apply matches by
+                # diff_id (uncompressed), so it covers the layer regardless
+                # of the final compressed digest.
+                # Mark as covered by position.
+                pass
+            else:
+                # Original blob copy — its digest is the target digest
+                blob_path = layer["digest"].replace("sha256:", "blobs/sha256/")
+                if blob_path in delta_blob_names:
+                    covered.add(layer["digest"])
+
+    # 3. Since tar-diffs are matched by position/diff_id, we can't easily
+    #    map them to target digests here.  Instead, do a simpler check:
+    #    count how many layers the delta processes (tar-diffs + copies)
+    #    vs how many the target needs.  Any shortfall = skipped layers.
+    #
+    #    More reliable: just count non-meta layers in the delta manifest.
+    delta_layer_count = sum(
+        1 for l in dmanifest["layers"]
+        if l.get("annotations", {}).get(
+            "io.github.containers.delta.content", ""
+        ) == "image-layer"
+    )
+    # Add original-copy layers (no delta.content annotation, and blob exists in delta)
+    delta_copy_count = sum(
+        1 for l in dmanifest["layers"]
+        if not l.get("annotations", {}).get("io.github.containers.delta.content")
+        and l["digest"].replace("sha256:", "blobs/sha256/") in delta_blob_names
+    )
+    total_delta_layers = delta_layer_count + delta_copy_count
+    target_layer_count = len(manifest["layers"])
+
+    if total_delta_layers >= target_layer_count:
+        # No skipped layers
+        if supplement_path.exists():
+            supplement_path.unlink()
+        return []
+
+    # 4. We know there are skipped layers.  To find exactly which ones,
+    #    do a test: run oci-delta apply to a temp location and check
+    #    which blobs are missing.  This is the most reliable method.
+    #    But it requires the source image too.
+    #
+    #    Simpler heuristic: layers in the target that also exist in the
+    #    OLD archive with the same digest are the ones oci-delta skips.
+    with _tarfile.open(str(target_archive)) as tgt:
+        # Get path to old archive — it's the source used to create the delta.
+        # We figure out which archive by looking at what prepare_delta_artifacts
+        # computed.  For now, find it from the delta filename.
+        old_archive_path = delta_file.parent / (
+            delta_file.name.split("-to-")[0] + ".oci-archive"
+        )
+        if not old_archive_path.exists():
+            log.warning("Cannot find old archive to identify skipped blobs: %s",
+                        old_archive_path)
+            return []
+
+        with _tarfile.open(str(old_archive_path)) as old:
+            old_blob_names = set(old.getnames())
+
+            # Blobs that exist in both old and target archives (by path = same digest)
+            target_blob_paths = set()
+            for layer in manifest["layers"]:
+                target_blob_paths.add(
+                    layer["digest"].replace("sha256:", "blobs/sha256/")
+                )
+
+            shared_blobs = target_blob_paths & old_blob_names
+            # The skipped count should match: target_layers - delta_layers
+            expected_skipped = target_layer_count - total_delta_layers
+            if len(shared_blobs) != expected_skipped:
+                log.warning(
+                    "Expected %d skipped blobs but found %d shared; "
+                    "extracting all shared blobs to be safe",
+                    expected_skipped, len(shared_blobs),
+                )
+
+            if not shared_blobs:
+                return []
+
+            # 5. Extract shared (skipped) blobs from target archive into supplement
+            log.info("Extracting %d skipped blobs into supplement...",
+                     len(shared_blobs))
+            with _tarfile.open(str(supplement_path), "w") as sup:
+                for blob_path in sorted(shared_blobs):
+                    member = tgt.getmember(blob_path)
+                    sup.addfile(member, tgt.extractfile(blob_path))
+
+    return sorted(shared_blobs)
+
+
 DERIVED_IMAGE_TAG = "localhost/bootc-bench-base:latest"
 
 
@@ -1123,12 +1277,24 @@ def prepare_delta_artifacts(
         oci_delta_bin, old_archive, new_archive, delta_file
     )
 
+    # Workaround for oci-delta bug: layers identical between old/new
+    # images are skipped during create and missing from apply output.
+    # Extract them from the target archive into a small supplement tar
+    # so we can inject them after apply.
+    supplement_file = archives_dir / f"{old_label}-to-{safe_name(target_image)}.supplement.tar"
+    skipped = _create_blob_supplement(delta_file, new_archive, supplement_file)
+    if skipped:
+        log.info("Created blob supplement with %d skipped blobs (%s)",
+                 len(skipped), format_bytes(supplement_file.stat().st_size))
+
     return {
         "old_image": old_image_ref,
         "old_from_local_storage": old_from_local,
         "old_archive": str(old_archive),
         "new_archive": str(new_archive),
         "delta_file": str(delta_file),
+        "supplement_file": str(supplement_file) if skipped else None,
+        "supplement_blob_count": len(skipped),
         "old_archive_size_bytes": old_archive.stat().st_size,
         "new_archive_size_bytes": new_archive.stat().st_size,
         "delta_size_bytes": delta_size,
@@ -1197,7 +1363,8 @@ def run_iteration_delta(
         monitor = ResourceMonitor(vm_mgr, dom)
         monitor.start()
 
-        # 6. Transfer delta file + oci-delta binary into VM
+        # 6. Transfer delta file + oci-delta binary + supplement into VM
+        supplement_file = delta_artifacts.get("supplement_file")
         log.info("[Delta Iter %d] Transferring delta (%.1f MB) and oci-delta binary...",
                  iteration_num, delta_file.stat().st_size / 1024**2)
         transfer_start = time.time()
@@ -1206,6 +1373,8 @@ def run_iteration_delta(
         ssh.upload_file(str(delta_file), "/tmp/update.delta")
         ssh.upload_file(str(oci_delta_bin), "/tmp/oci-delta")
         ssh.run("chmod +x /tmp/oci-delta")
+        if supplement_file:
+            ssh.upload_file(supplement_file, "/tmp/supplement.tar")
 
         transfer_end = time.time()
         transfer_duration = transfer_end - transfer_start
@@ -1249,6 +1418,25 @@ def run_iteration_delta(
 
         log.info("[Delta Iter %d] Delta apply completed in %.1fs",
                  iteration_num, apply_duration)
+
+        # 7b. Inject any skipped blobs (oci-delta bug workaround)
+        if supplement_file:
+            log.info("[Delta Iter %d] Injecting supplement blobs...", iteration_num)
+            # The supplement tar contains blobs at their OCI paths
+            # (e.g. blobs/sha256/<digest>).  Append them to the
+            # oci-archive tar so bootc can find them.
+            rc, out, err = ssh.run(
+                "bash -c '"
+                "WORK=$(mktemp -d) && "
+                "tar xf /tmp/supplement.tar -C $WORK && "
+                "tar rf /tmp/new.oci-archive -C $WORK blobs && "
+                "rm -rf $WORK /tmp/supplement.tar"
+                "'",
+                timeout=60,
+            )
+            if rc != 0:
+                log.warning("[Delta Iter %d] Supplement injection returned rc=%d: %s",
+                            iteration_num, rc, out)
 
         # 8. Stage phase: bootc switch to local OCI archive
         log.info("[Delta Iter %d] Running bootc switch (oci-archive)...", iteration_num)
