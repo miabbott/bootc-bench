@@ -341,38 +341,6 @@ class VMManager:
 # Resource monitor (runs in background thread)
 # ---------------------------------------------------------------------------
 
-class SudoKeepalive:
-    """Keep sudo credentials alive in a background thread."""
-
-    def __init__(self, interval: float = 60):
-        self.interval = interval
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self):
-        # Initial sudo -v to cache credentials
-        subprocess.run(["sudo", "-v"], check=True)
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        log.debug("Sudo keepalive started")
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-
-    def _run(self):
-        while not self._stop.is_set():
-            self._stop.wait(self.interval)
-            if not self._stop.is_set():
-                try:
-                    subprocess.run(["sudo", "-v"], check=True,
-                                   capture_output=True, timeout=10)
-                except Exception:
-                    pass
-
-
 class ResourceMonitor:
     """Collect CPU/memory samples in a background thread."""
 
@@ -514,9 +482,10 @@ def build_base_qcow2(
             f"bootc-image-builder did not produce expected output at {built_qcow2}"
         )
 
-    subprocess.run(["sudo", "cp", str(built_qcow2), str(qcow2_path)], check=True)
+    # BIB output is owned by root — chown it so we can copy without sudo
     subprocess.run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}",
-                    str(qcow2_path)], check=True)
+                    str(built_qcow2)], check=True)
+    shutil.copy2(str(built_qcow2), str(qcow2_path))
     log.info("Base qcow2 ready: %s", qcow2_path)
     return qcow2_path
 
@@ -831,20 +800,16 @@ def run_iteration(
     ssh = None
 
     try:
-        # 1. Copy base qcow2 (use sudo since work dir may be under /var/lib/libvirt)
+        # 1. Copy base qcow2
         log.info("[Iter %d] Copying base qcow2...", iteration_num)
         subprocess.run(
-            ["sudo", "cp", str(base_qcow2), str(disk_path)],
-            check=True,
-        )
-        subprocess.run(
-            ["sudo", "chmod", "0644", str(disk_path)],
+            ["cp", str(base_qcow2), str(disk_path)],
             check=True,
         )
 
         # Resize disk to ensure enough space for upgrade
         subprocess.run(
-            ["sudo", "qemu-img", "resize", str(disk_path),
+            ["qemu-img", "resize", str(disk_path),
              f"{DEFAULT_VM_DISK_GB}G"],
             check=True, capture_output=True,
         )
@@ -996,8 +961,7 @@ def run_iteration(
         if dom:
             vm_mgr.destroy_vm(dom)
         if disk_path.exists():
-            subprocess.run(["sudo", "rm", "-f", str(disk_path)],
-                           check=False)
+            disk_path.unlink(missing_ok=True)
             log.debug("Deleted disk %s", disk_path)
 
     return result
@@ -1126,10 +1090,9 @@ def run_iteration_delta(
     try:
         # 1. Copy base qcow2
         log.info("[Delta Iter %d] Copying base qcow2...", iteration_num)
-        subprocess.run(["sudo", "cp", str(base_qcow2), str(disk_path)], check=True)
-        subprocess.run(["sudo", "chmod", "0644", str(disk_path)], check=True)
+        subprocess.run(["cp", str(base_qcow2), str(disk_path)], check=True)
         subprocess.run(
-            ["sudo", "qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
+            ["qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
             check=True, capture_output=True,
         )
 
@@ -1310,7 +1273,7 @@ def run_iteration_delta(
         if dom:
             vm_mgr.destroy_vm(dom)
         if disk_path.exists():
-            subprocess.run(["sudo", "rm", "-f", str(disk_path)], check=False)
+            disk_path.unlink(missing_ok=True)
 
     return result
 
@@ -1386,20 +1349,17 @@ def compute_summary(results: list[IterationResult]) -> dict:
 
 def run_benchmark(args) -> dict:
     """Run the full benchmark suite."""
-    # Keep sudo credentials alive throughout the run
-    sudo_keepalive = SudoKeepalive()
-    sudo_keepalive.start()
-
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Default work dir under libvirt images path so qemu can access disks
+    # Work dir for temporary VM disks.  Defaults to /var/tmp/bootc-bench
+    # which is world-accessible so the qemu process (uid 107) can read
+    # disk images without sudo or ACLs.
     if args.work_dir:
         work_dir = Path(args.work_dir).resolve()
     else:
-        work_dir = Path("/var/lib/libvirt/images/bootc-bench")
-    subprocess.run(["sudo", "mkdir", "-p", str(work_dir)], check=True)
-    subprocess.run(["sudo", "chmod", "0775", str(work_dir)], check=True)
+        work_dir = Path("/var/tmp/bootc-bench")
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     targets = args.targets or DEFAULT_TARGETS
     base_image = args.base_image
@@ -1512,7 +1472,6 @@ def run_benchmark(args) -> dict:
 
     finally:
         vm_mgr.close()
-        sudo_keepalive.stop()
 
     # Write results
     results_file = output_dir / "results.json"
