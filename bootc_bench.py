@@ -42,6 +42,10 @@ DEFAULT_ITERATIONS = 3
 DEFAULT_VM_MEMORY_MB = 4096
 DEFAULT_VM_VCPUS = 2
 DEFAULT_VM_DISK_GB = 40
+# Process scheduling: run heavy host-side work at reduced priority so the
+# benchmark doesn't starve the desktop.  nice 10 = lower CPU priority,
+# ionice -c3 = idle I/O class (only uses I/O when nothing else needs it).
+NICE_PREFIX = ["nice", "-n", "10", "ionice", "-c3"]
 BIB_IMAGE = "registry.redhat.io/rhel9/bootc-image-builder"
 OCI_DELTA_BIN_DEFAULT = "./oci-delta"
 MONITOR_INTERVAL_SEC = 2
@@ -204,6 +208,10 @@ class VMManager:
             <apic/>
           </features>
           <cpu mode='host-passthrough'/>
+          <cputune>
+            <period>100000</period>
+            <quota>{cpu_quota}</quota>
+          </cputune>
           <devices>
             <disk type='file' device='disk'>
               <driver name='qemu' type='qcow2'/>
@@ -246,11 +254,15 @@ class VMManager:
                   memory_mb: int = DEFAULT_VM_MEMORY_MB,
                   vcpus: int = DEFAULT_VM_VCPUS) -> libvirt.virDomain:
         """Define and start a VM."""
+        # Cap each vCPU to ~50% of a host core so the VM doesn't
+        # starve the desktop.  period=100ms, quota = vcpus * 50ms.
+        cpu_quota = vcpus * 50000
         xml = self.DOMAIN_XML_TEMPLATE.format(
             name=name,
             uuid=str(uuid.uuid4()),
             memory_mb=memory_mb,
             vcpus=vcpus,
+            cpu_quota=cpu_quota,
             disk_path=disk_path,
         )
         dom = self.conn.defineXML(xml)
@@ -450,10 +462,11 @@ def build_base_qcow2(
 
     # Find the host's registry auth file so sudo podman can pull images
     authfile = _find_authfile()
-    build_cmd = ["sudo", "podman", "build", "-t", derived_tag,
+    build_cmd = NICE_PREFIX + ["sudo", "podman", "build", "-t", derived_tag,
                  "-f", str(containerfile), str(build_dir)]
     if authfile:
-        build_cmd.insert(3, f"--authfile={authfile}")
+        # Insert after NICE_PREFIX + "sudo"
+        build_cmd.insert(len(NICE_PREFIX) + 2, f"--authfile={authfile}")
         log.info("Using authfile: %s", authfile)
 
     subprocess.run(build_cmd, check=True)
@@ -463,11 +476,13 @@ def build_base_qcow2(
     bib_output.mkdir(parents=True, exist_ok=True)
 
     log.info("Running bootc-image-builder (this may take several minutes)...")
-    bib_cmd = ["sudo", "podman", "run",
-               "--rm", "--privileged", f"--pull=newer",
-               f"--authfile={authfile}" if authfile else None,
-               "-v", f"{bib_output}:/output",
-               "-v", "/var/lib/containers/storage:/var/lib/containers/storage"]
+    bib_cmd = NICE_PREFIX + [
+        "sudo", "podman", "run",
+        "--rm", "--privileged", f"--pull=newer",
+        f"--authfile={authfile}" if authfile else None,
+        "-v", f"{bib_output}:/output",
+        "-v", "/var/lib/containers/storage:/var/lib/containers/storage",
+    ]
     # Remove None entries
     bib_cmd = [x for x in bib_cmd if x is not None]
     if authfile:
@@ -803,13 +818,13 @@ def run_iteration(
         # 1. Copy base qcow2
         log.info("[Iter %d] Copying base qcow2...", iteration_num)
         subprocess.run(
-            ["cp", str(base_qcow2), str(disk_path)],
+            NICE_PREFIX + ["cp", str(base_qcow2), str(disk_path)],
             check=True,
         )
 
         # Resize disk to ensure enough space for upgrade
         subprocess.run(
-            ["qemu-img", "resize", str(disk_path),
+            NICE_PREFIX + ["qemu-img", "resize", str(disk_path),
              f"{DEFAULT_VM_DISK_GB}G"],
             check=True, capture_output=True,
         )
@@ -978,7 +993,7 @@ def export_oci_archive(image_ref: str, output_path: Path,
         log.info("OCI archive already exists: %s", output_path)
         return 0.0
     log.info("Exporting %s to %s ...", image_ref, output_path)
-    cmd = ["skopeo", "copy",
+    cmd = NICE_PREFIX + ["skopeo", "copy",
            "--override-arch", "amd64",
            "--remove-signatures",
            f"docker://{image_ref}",
@@ -998,10 +1013,18 @@ def create_delta(oci_delta_bin: Path, old_archive: Path, new_archive: Path,
     """Run oci-delta create. Returns (duration_sec, delta_size_bytes)."""
     if delta_path.exists():
         delta_path.unlink()
-    log.info("Creating delta: %s → %s", old_archive.name, new_archive.name)
+    # oci-delta create is extremely CPU+IO intensive (binary diffing of
+    # multi-GB archives).  Pin it to half the available cores via taskset
+    # on top of the nice/ionice wrapper so it can't starve the desktop.
+    ncpus = os.cpu_count() or 4
+    half = max(1, ncpus // 2)
+    cpu_mask = ",".join(str(c) for c in range(half))
+    log.info("Creating delta: %s → %s (pinned to CPUs %s)",
+             old_archive.name, new_archive.name, cpu_mask)
     start = time.time()
     subprocess.run(
-        [str(oci_delta_bin), "create", "--verbose",
+        NICE_PREFIX + ["taskset", "-c", cpu_mask,
+         str(oci_delta_bin), "create", "--verbose",
          str(old_archive), str(new_archive), str(delta_path)],
         check=True,
     )
@@ -1090,9 +1113,9 @@ def run_iteration_delta(
     try:
         # 1. Copy base qcow2
         log.info("[Delta Iter %d] Copying base qcow2...", iteration_num)
-        subprocess.run(["cp", str(base_qcow2), str(disk_path)], check=True)
+        subprocess.run(NICE_PREFIX + ["cp", str(base_qcow2), str(disk_path)], check=True)
         subprocess.run(
-            ["qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
+            NICE_PREFIX + ["qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
             check=True, capture_output=True,
         )
 
