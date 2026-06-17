@@ -573,12 +573,11 @@ def build_base_qcow2(
 
     # Find the host's registry auth file so sudo podman can pull images
     authfile = _find_authfile()
-    build_cmd = NICE_PREFIX + ["sudo", "podman", "build", "-t", derived_tag,
-                 "-f", str(containerfile), str(build_dir)]
+    build_cmd = NICE_PREFIX + ["sudo", "podman", "build"]
     if authfile:
-        # Insert after NICE_PREFIX + "sudo"
-        build_cmd.insert(len(NICE_PREFIX) + 2, f"--authfile={authfile}")
+        build_cmd.append(f"--authfile={authfile}")
         log.info("Using authfile: %s", authfile)
+    build_cmd.extend(["-t", derived_tag, "-f", str(containerfile), str(build_dir)])
 
     subprocess.run(build_cmd, check=True)
 

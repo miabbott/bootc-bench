@@ -1,9 +1,7 @@
 __pycache__/
 *.pyc
 bootc-bench-results*/
-run-baseline/
-run-delta/
-run-comparison/
+run-*/
 test-run/
 test-run-delta/
 *.qcow2
