@@ -406,10 +406,11 @@ def _find_authfile() -> Optional[str]:
     return None
 
 
-def generate_ssh_keypair(output_dir: Path) -> tuple[Path, Path]:
+def generate_ssh_keypair(ssh_dir: Path) -> tuple[Path, Path]:
     """Generate an SSH keypair for VM access, return (private, public) paths."""
-    priv_key = output_dir / "bootc-bench-key"
-    pub_key = output_dir / "bootc-bench-key.pub"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    priv_key = ssh_dir / "bootc-bench-key"
+    pub_key = ssh_dir / "bootc-bench-key.pub"
     if priv_key.exists():
         log.info("SSH keypair already exists at %s", priv_key)
         return priv_key, pub_key
@@ -1620,6 +1621,21 @@ def run_benchmark(args) -> dict:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Shared cache for expensive reusable artifacts (qcow2, OCI archives,
+    # delta files, SSH keys).  Persists across timestamped runs so only
+    # the first run pays the build cost.
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir).resolve()
+    else:
+        cache_dir = Path.home() / ".cache" / "bootc-bench"
+
+    if args.fresh and cache_dir.exists():
+        log.info("--fresh: wiping cache at %s", cache_dir)
+        shutil.rmtree(cache_dir)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log.info("Cache directory: %s", cache_dir)
+
     # Work dir for temporary VM disks.  Defaults to /var/tmp/bootc-bench
     # which is world-accessible so the qemu process (uid 107) can read
     # disk images without sudo or ACLs.
@@ -1632,17 +1648,17 @@ def run_benchmark(args) -> dict:
     targets = args.targets or DEFAULT_TARGETS
     base_image = args.base_image
 
-    # Generate SSH keys
-    ssh_priv, ssh_pub = generate_ssh_keypair(output_dir)
+    # Generate SSH keys (cached)
+    ssh_priv, ssh_pub = generate_ssh_keypair(cache_dir / "ssh")
 
-    # Build base qcow2 (or use existing)
+    # Build base qcow2 (cached, or use explicit --qcow2 override)
     if args.qcow2:
         base_qcow2 = Path(args.qcow2).resolve()
         if not base_qcow2.exists():
             raise FileNotFoundError(f"Provided qcow2 not found: {base_qcow2}")
         log.info("Using provided qcow2: %s", base_qcow2)
     else:
-        base_qcow2 = build_base_qcow2(base_image, output_dir, ssh_pub)
+        base_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub)
 
     # Connect to libvirt
     vm_mgr = VMManager(uri=args.libvirt_uri)
@@ -1696,7 +1712,7 @@ def run_benchmark(args) -> dict:
                 #  2. Derived image in root podman storage → export it
                 #  3. Fall back to raw base image (may cause digest mismatch)
                 derived_image = None
-                derived_archive = output_dir / "archives" / "derived.oci-archive"
+                derived_archive = cache_dir / "archives" / "derived.oci-archive"
                 if derived_archive.exists():
                     # Archive already exported — tell prepare_delta_artifacts
                     # to use the "derived" label so it picks up this file.
@@ -1723,7 +1739,7 @@ def run_benchmark(args) -> dict:
                             DERIVED_IMAGE_TAG, derived_archive, base_image,
                         )
                 delta_artifacts = prepare_delta_artifacts(
-                    base_image, target, oci_delta_bin, output_dir,
+                    base_image, target, oci_delta_bin, cache_dir,
                     derived_image=derived_image,
                 )
 
@@ -1851,6 +1867,15 @@ def main():
     parser.add_argument(
         "--oci-delta-bin", default=OCI_DELTA_BIN_DEFAULT,
         help=f"Path to oci-delta binary (default: {OCI_DELTA_BIN_DEFAULT})",
+    )
+    parser.add_argument(
+        "--cache-dir", default=None,
+        help="Shared cache directory for reusable artifacts "
+             "(default: ~/.cache/bootc-bench)",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="Wipe the cache and rebuild all artifacts from scratch",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
