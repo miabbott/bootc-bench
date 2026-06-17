@@ -1818,9 +1818,11 @@ def main():
         "-n", "--iterations", type=int, default=DEFAULT_ITERATIONS,
         help=f"Number of iterations per target (default: {DEFAULT_ITERATIONS})",
     )
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     parser.add_argument(
-        "-o", "--output-dir", default="./bootc-bench-results",
-        help="Output directory for results and artifacts",
+        "-o", "--output-dir", default=f"./bootc-bench-results-{timestamp}",
+        help="Output directory for results and artifacts "
+             "(default: ./bootc-bench-results-YYYYMMDD-HHMMSS)",
     )
     parser.add_argument(
         "-w", "--work-dir", default=None,
