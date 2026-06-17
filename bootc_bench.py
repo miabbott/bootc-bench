@@ -987,21 +987,44 @@ def run_iteration(
 # ---------------------------------------------------------------------------
 
 def export_oci_archive(image_ref: str, output_path: Path,
-                       authfile: Optional[str] = None) -> float:
-    """Export a container image to an OCI archive via skopeo. Returns duration."""
+                       authfile: Optional[str] = None,
+                       from_local_storage: bool = False) -> float:
+    """Export a container image to an OCI archive via skopeo. Returns duration.
+
+    Args:
+        image_ref: Image reference (registry ref or local image tag).
+        output_path: Destination OCI archive path.
+        authfile: Registry auth file (only used for registry pulls).
+        from_local_storage: If True, pull from local podman storage via
+            ``containers-storage:`` instead of ``docker://``.  Requires
+            sudo because the derived image lives in the root podman store.
+    """
     if output_path.exists():
         log.info("OCI archive already exists: %s", output_path)
         return 0.0
     log.info("Exporting %s to %s ...", image_ref, output_path)
-    cmd = NICE_PREFIX + ["skopeo", "copy",
-           "--override-arch", "amd64",
-           "--remove-signatures",
-           f"docker://{image_ref}",
-           f"oci-archive:{output_path}"]
-    if authfile:
-        cmd.extend(["--authfile", authfile])
+    if from_local_storage:
+        # Export from local (root) podman storage
+        cmd = NICE_PREFIX + ["sudo", "skopeo", "copy",
+               "--remove-signatures",
+               f"containers-storage:{image_ref}",
+               f"oci-archive:{output_path}"]
+    else:
+        cmd = NICE_PREFIX + ["skopeo", "copy",
+               "--override-arch", "amd64",
+               "--remove-signatures",
+               f"docker://{image_ref}",
+               f"oci-archive:{output_path}"]
+        if authfile:
+            cmd.extend(["--authfile", authfile])
     start = time.time()
     subprocess.run(cmd, check=True)
+    # Fix ownership if exported via sudo
+    if from_local_storage:
+        subprocess.run(
+            ["sudo", "chown", f"{os.getuid()}:{os.getgid()}", str(output_path)],
+            check=False,
+        )
     duration = time.time() - start
     size_mb = output_path.stat().st_size / 1024**2
     log.info("Exported %s (%.0f MB) in %.1fs", output_path.name, size_mb, duration)
@@ -1035,15 +1058,41 @@ def create_delta(oci_delta_bin: Path, old_archive: Path, new_archive: Path,
     return duration, size
 
 
+def format_bytes(b: int | float) -> str:
+    """Human-readable byte size."""
+    b = float(b)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(b) < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def safe_name(ref: str) -> str:
+    """Sanitize an image reference for use in filenames."""
+    return ref.split("/")[-1].replace(":", "-")
+
+
+DERIVED_IMAGE_TAG = "localhost/bootc-bench-base:latest"
+
+
 def prepare_delta_artifacts(
     base_image: str,
     target_image: str,
     oci_delta_bin: Path,
     output_dir: Path,
+    derived_image: Optional[str] = None,
 ) -> dict:
     """Prepare OCI archives and delta file for a given base→target pair.
 
     Done once per target, outside the iteration loop.
+
+    When a derived image tag is provided (e.g.
+    ``localhost/bootc-bench-base:latest``), the "old" OCI archive is
+    exported from local podman storage instead of the registry.  This
+    ensures the delta's source config-digest matches the ostree ref
+    deployed inside the VM so ``oci-delta apply --ostree-repo`` works.
+
     Returns a dict with paths and timing info.
     """
     archives_dir = output_dir / "archives"
@@ -1051,16 +1100,22 @@ def prepare_delta_artifacts(
 
     authfile = _find_authfile()
 
-    # Sanitize image refs for filenames
-    def safe_name(ref: str) -> str:
-        return ref.split("/")[-1].replace(":", "-")
+    # Determine what to use as the "old" (source) image for the delta.
+    # If a derived image exists in local storage, use it — its config
+    # digest will match the VM's ostree repo.
+    old_image_ref = derived_image or base_image
+    old_from_local = derived_image is not None
 
-    old_archive = archives_dir / f"{safe_name(base_image)}.oci-archive"
+    old_label = "derived" if old_from_local else safe_name(base_image)
+    old_archive = archives_dir / f"{old_label}.oci-archive"
     new_archive = archives_dir / f"{safe_name(target_image)}.oci-archive"
-    delta_file = archives_dir / f"{safe_name(base_image)}-to-{safe_name(target_image)}.delta"
+    delta_file = archives_dir / f"{old_label}-to-{safe_name(target_image)}.delta"
 
     # Export both images
-    old_export_time = export_oci_archive(base_image, old_archive, authfile)
+    old_export_time = export_oci_archive(
+        old_image_ref, old_archive, authfile,
+        from_local_storage=old_from_local,
+    )
     new_export_time = export_oci_archive(target_image, new_archive, authfile)
 
     # Create delta
@@ -1069,6 +1124,8 @@ def prepare_delta_artifacts(
     )
 
     return {
+        "old_image": old_image_ref,
+        "old_from_local_storage": old_from_local,
         "old_archive": str(old_archive),
         "new_archive": str(new_archive),
         "delta_file": str(delta_file),
@@ -1441,8 +1498,45 @@ def run_benchmark(args) -> dict:
             delta_artifacts = None
             if mode == "delta":
                 log.info("Preparing delta artifacts...")
+                # The delta must be created from the *derived* image (the
+                # one actually deployed on the VM, with SSH keys baked in)
+                # so that oci-delta apply can match the config digest in
+                # /ostree/repo.
+                #
+                # Check in order:
+                #  1. derived.oci-archive already on disk → use it (no sudo)
+                #  2. Derived image in root podman storage → export it
+                #  3. Fall back to raw base image (may cause digest mismatch)
+                derived_image = None
+                derived_archive = output_dir / "archives" / "derived.oci-archive"
+                if derived_archive.exists():
+                    # Archive already exported — tell prepare_delta_artifacts
+                    # to use the "derived" label so it picks up this file.
+                    derived_image = DERIVED_IMAGE_TAG
+                    log.info("Using existing derived archive: %s",
+                             derived_archive)
+                else:
+                    # Need to export — check if the image is in podman storage
+                    rc = subprocess.run(
+                        ["sudo", "podman", "image", "exists",
+                         DERIVED_IMAGE_TAG],
+                    ).returncode
+                    if rc == 0:
+                        derived_image = DERIVED_IMAGE_TAG
+                        log.info("Will export derived image: %s",
+                                 derived_image)
+                    else:
+                        log.warning(
+                            "Derived image %s not found in podman "
+                            "storage and no cached archive at %s; "
+                            "falling back to raw base image %s. "
+                            "This may fail if the VM was built from a "
+                            "derived image with a different config digest.",
+                            DERIVED_IMAGE_TAG, derived_archive, base_image,
+                        )
                 delta_artifacts = prepare_delta_artifacts(
                     base_image, target, oci_delta_bin, output_dir,
+                    derived_image=derived_image,
                 )
 
             benchmark = {
