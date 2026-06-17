@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 import textwrap
 import threading
+import urllib.request
+import urllib.error
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -48,6 +50,11 @@ DEFAULT_VM_DISK_GB = 40
 NICE_PREFIX = ["nice", "-n", "10", "ionice", "-c3"]
 BIB_IMAGE = "registry.redhat.io/rhel9/bootc-image-builder"
 OCI_DELTA_BIN_DEFAULT = "./oci-delta"
+REGISTRY_CONTAINER_NAME = "bootc-bench-registry"
+REGISTRY_IMAGE = "docker.io/library/registry:2"
+REGISTRY_HOST_PORT = 5000
+# The host IP as seen from VMs on the default libvirt network.
+LIBVIRT_HOST_IP = "192.168.122.1"
 MONITOR_INTERVAL_SEC = 2
 SSH_TIMEOUT_SEC = 300
 SSH_PORT = 22
@@ -389,6 +396,106 @@ class ResourceMonitor:
 
 
 # ---------------------------------------------------------------------------
+# Local registry management
+# ---------------------------------------------------------------------------
+
+def start_local_registry() -> str:
+    """Start a local OCI registry container. Returns the host:port address.
+
+    Uses rootless podman so no sudo is needed.  The registry listens on
+    localhost:<REGISTRY_HOST_PORT> (host side) and is reachable from
+    libvirt VMs at <LIBVIRT_HOST_IP>:<REGISTRY_HOST_PORT>.
+    """
+    addr = f"localhost:{REGISTRY_HOST_PORT}"
+    vm_addr = f"{LIBVIRT_HOST_IP}:{REGISTRY_HOST_PORT}"
+
+    # Check if already running
+    rc = subprocess.run(
+        ["podman", "inspect", REGISTRY_CONTAINER_NAME],
+        capture_output=True,
+    ).returncode
+    if rc == 0:
+        log.info("Local registry already running at %s (VM: %s)", addr, vm_addr)
+        return vm_addr
+
+    log.info("Starting local registry container (%s)...", REGISTRY_IMAGE)
+    subprocess.run(
+        ["podman", "run", "-d",
+         "--name", REGISTRY_CONTAINER_NAME,
+         "-p", f"{REGISTRY_HOST_PORT}:5000",
+         REGISTRY_IMAGE],
+        check=True,
+    )
+    # Wait briefly for the registry to be ready
+    for _ in range(10):
+        try:
+            urllib.request.urlopen(f"http://{addr}/v2/", timeout=2)
+            break
+        except Exception:
+            time.sleep(1)
+    log.info("Local registry running at %s (VM: %s)", addr, vm_addr)
+    return vm_addr
+
+
+def stop_local_registry():
+    """Stop and remove the local registry container."""
+    subprocess.run(
+        ["podman", "rm", "-f", REGISTRY_CONTAINER_NAME],
+        capture_output=True,
+    )
+    log.info("Local registry stopped")
+
+
+def push_to_local_registry(
+    source_image: str,
+    tag: str,
+    compress_format: Optional[str] = None,
+) -> None:
+    """Push a container image to the local registry via skopeo.
+
+    Args:
+        source_image: Full source image reference (e.g. registry.redhat.io/...).
+        tag: Destination tag in the local registry (e.g. "rhel-bootc:9.8-gzip").
+        compress_format: Destination compression format (e.g. "zstd:chunked")
+            or None for the source format.
+    """
+    dest = f"docker://localhost:{REGISTRY_HOST_PORT}/{tag}"
+    authfile = _find_authfile()
+
+    # Check if already pushed by querying the registry
+    repo, ref = tag.split(":", 1) if ":" in tag else (tag, "latest")
+    try:
+        import urllib.request, urllib.error
+        url = f"http://localhost:{REGISTRY_HOST_PORT}/v2/{repo}/manifests/{ref}"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.oci.image.manifest.v1+json,"
+                      "application/vnd.docker.distribution.manifest.v2+json"
+        })
+        urllib.request.urlopen(req, timeout=5)
+        fmt_label = compress_format or "source"
+        log.info("Image already in local registry: %s (%s)", tag, fmt_label)
+        return
+    except Exception:
+        pass  # Not present, need to push
+
+    cmd = NICE_PREFIX + [
+        "skopeo", "copy",
+        "--dest-tls-verify=false",
+    ]
+    if compress_format:
+        cmd.extend(["--dest-compress-format", compress_format])
+    cmd.extend([f"docker://{source_image}", dest])
+    if authfile:
+        cmd.extend(["--src-authfile", authfile])
+
+    fmt_label = compress_format or "source"
+    log.info("Pushing %s to local registry as %s (%s)...",
+             source_image, tag, fmt_label)
+    subprocess.run(cmd, check=True)
+    log.info("Pushed %s", tag)
+
+
+# ---------------------------------------------------------------------------
 # Image builder
 # ---------------------------------------------------------------------------
 
@@ -456,6 +563,9 @@ def build_base_qcow2(
         RUN chmod 600 /root/.ssh/authorized_keys
         # Ensure sshd is enabled
         RUN systemctl enable sshd
+        # Trust the local benchmark registry (insecure, no TLS)
+        RUN printf '[[registry]]\\nlocation = "{LIBVIRT_HOST_IP}:{REGISTRY_HOST_PORT}"\\ninsecure = true\\n' \\
+            > /etc/containers/registries.conf.d/bootc-bench-local.conf
     """))
 
     derived_tag = "localhost/bootc-bench-base:latest"
@@ -807,9 +917,10 @@ def run_iteration(
     target_layer_info: Optional[dict] = None,
     vm_memory_mb: int = DEFAULT_VM_MEMORY_MB,
     vm_vcpus: int = DEFAULT_VM_VCPUS,
+    mode: str = "baseline",
 ) -> IterationResult:
     """Run a single benchmark iteration."""
-    result = IterationResult(iteration=iteration_num)
+    result = IterationResult(iteration=iteration_num, mode=mode)
     vm_name = f"bootc-bench-{iteration_num}-{uuid.uuid4().hex[:8]}"
     disk_path = work_dir / f"{vm_name}.qcow2"
     dom = None
@@ -1665,11 +1776,17 @@ def run_benchmark(args) -> dict:
     vm_mgr.connect()
 
     mode = getattr(args, "mode", "baseline")
+    uses_local_registry = mode in ("baseline-gzip", "baseline-zstd")
     oci_delta_bin = None
     if mode == "delta":
         oci_delta_bin = Path(args.oci_delta_bin).resolve()
         if not oci_delta_bin.exists():
             raise FileNotFoundError(f"oci-delta binary not found: {oci_delta_bin}")
+
+    # Start local registry for gzip/zstd modes
+    registry_addr = None
+    if uses_local_registry:
+        registry_addr = start_local_registry()
 
     all_results = {
         "config": {
@@ -1690,6 +1807,21 @@ def run_benchmark(args) -> dict:
             log.info("Benchmarking [%s] upgrade: %s -> %s",
                      mode, base_image, target)
             log.info("=" * 60)
+
+            # For local registry modes, push the target image and
+            # translate the ref to point at the local registry.
+            effective_target = target
+            if uses_local_registry:
+                # Build a local tag from the original ref
+                # e.g. "registry.redhat.io/rhel9/rhel-bootc:9.8"
+                #   → "rhel-bootc:9.8-gzip" or "rhel-bootc:9.8-zstd-chunked"
+                base_name = target.split("/")[-1]  # "rhel-bootc:9.8"
+                suffix = "gzip" if mode == "baseline-gzip" else "zstd-chunked"
+                compress_fmt = None if mode == "baseline-gzip" else "zstd:chunked"
+                local_tag = f"{base_name}-{suffix}"
+                push_to_local_registry(target, local_tag, compress_fmt)
+                effective_target = f"{registry_addr}/{local_tag}"
+                log.info("Using local registry target: %s", effective_target)
 
             # Collect layer info once per target from the host
             log.info("Collecting target image layer info from host...")
@@ -1746,6 +1878,7 @@ def run_benchmark(args) -> dict:
             benchmark = {
                 "base_image": base_image,
                 "target_image": target,
+                "effective_target": effective_target,
                 "target_layer_info": target_layer_info,
                 "mode": mode,
                 "delta_artifacts": delta_artifacts,
@@ -1777,13 +1910,14 @@ def run_benchmark(args) -> dict:
                     result = run_iteration(
                         iteration_num=i,
                         base_qcow2=base_qcow2,
-                        target_image=target,
+                        target_image=effective_target,
                         ssh_key_path=ssh_priv,
                         vm_mgr=vm_mgr,
                         work_dir=work_dir,
                         target_layer_info=target_layer_info,
                         vm_memory_mb=args.vm_memory,
                         vm_vcpus=args.vm_vcpus,
+                        mode=mode,
                     )
                 iteration_results.append(result)
                 benchmark["iterations"].append(asdict(result))
@@ -1793,6 +1927,8 @@ def run_benchmark(args) -> dict:
 
     finally:
         vm_mgr.close()
+        if uses_local_registry:
+            stop_local_registry()
 
     # Write results
     results_file = output_dir / "results.json"
@@ -1861,8 +1997,13 @@ def main():
         help=f"VM vCPUs (default: {DEFAULT_VM_VCPUS})",
     )
     parser.add_argument(
-        "-m", "--mode", choices=["baseline", "delta"], default="baseline",
-        help="Benchmark mode: 'baseline' (full pull) or 'delta' (oci-delta)",
+        "-m", "--mode",
+        choices=["baseline", "baseline-gzip", "baseline-zstd", "delta"],
+        default="baseline",
+        help="Benchmark mode: 'baseline' (pull from source registry), "
+             "'baseline-gzip' (pull gzip from local registry), "
+             "'baseline-zstd' (pull zstd:chunked from local registry), "
+             "or 'delta' (oci-delta)",
     )
     parser.add_argument(
         "--oci-delta-bin", default=OCI_DELTA_BIN_DEFAULT,
