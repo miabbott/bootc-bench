@@ -903,7 +903,175 @@ def wait_for_ssh_down(host: str, timeout: int = 60):
 
 
 # ---------------------------------------------------------------------------
-# Single iteration
+# Single iteration – shared lifecycle
+# ---------------------------------------------------------------------------
+
+def _run_iteration_lifecycle(
+    iteration_num: int,
+    base_qcow2: Path,
+    ssh_key_path: Path,
+    vm_mgr: VMManager,
+    work_dir: Path,
+    vm_memory_mb: int,
+    vm_vcpus: int,
+    result: IterationResult,
+    vm_name: str,
+    log_prefix: str,
+    upgrade_fn,
+    completion_log_fn,
+) -> IterationResult:
+    """Shared VM lifecycle for a single benchmark iteration.
+
+    Handles VM provisioning, SSH setup, pre-upgrade baseline, resource
+    monitoring, reboot, post-upgrade stats, and cleanup.  The mode-specific
+    upgrade work is delegated to *upgrade_fn*.
+
+    Args:
+        upgrade_fn: ``(ssh: SSH) -> float`` — perform the upgrade, populate
+            *result* fields (stage_phase, bootc_switch_output, etc.) via
+            closure.  Return any extra duration (beyond stage + reboot) to
+            include in total_duration_sec (0 for baseline modes, transfer +
+            apply for delta).  If the upgrade fails, set ``result.error`` and
+            the lifecycle handles the early return.
+        completion_log_fn: ``(stage_dur, reboot_dur, total_dur) -> None`` —
+            emit the mode-specific "Complete" log line.
+    """
+    disk_path = work_dir / f"{vm_name}.qcow2"
+    dom = None
+    ssh = None
+
+    try:
+        # 1. Copy base qcow2
+        log.info("[%s %d] Copying base qcow2...", log_prefix, iteration_num)
+        subprocess.run(
+            NICE_PREFIX + ["cp", str(base_qcow2), str(disk_path)],
+            check=True,
+        )
+
+        # Resize disk to ensure enough space for upgrade
+        subprocess.run(
+            NICE_PREFIX + ["qemu-img", "resize", str(disk_path),
+             f"{DEFAULT_VM_DISK_GB}G"],
+            check=True, capture_output=True,
+        )
+
+        # 2. Create and start VM
+        log.info("[%s %d] Starting VM %s...", log_prefix, iteration_num,
+                 vm_name)
+        dom = vm_mgr.create_vm(vm_name, str(disk_path),
+                               memory_mb=vm_memory_mb, vcpus=vm_vcpus)
+
+        # 3. Get VM IP and connect via SSH
+        vm_ip = vm_mgr.get_vm_ip(dom)
+        ssh = SSH(vm_ip, str(ssh_key_path))
+        ssh.connect()
+
+        # 4. Pre-upgrade baseline
+        log.info("[%s %d] Collecting pre-upgrade baseline...", log_prefix,
+                 iteration_num)
+        result.pre_upgrade = {
+            "bootc_status": collect_bootc_status(ssh),
+            "disk_usage": collect_disk_usage(ssh),
+        }
+
+        # 5. Start resource monitor
+        monitor = ResourceMonitor(vm_mgr, dom)
+        monitor.start()
+
+        # 6. Mode-specific upgrade work
+        extra_duration = upgrade_fn(ssh)
+
+        if result.error:
+            monitor.stop()
+            return result
+
+        stage_duration = (result.stage_phase.duration_sec
+                          if result.stage_phase else 0.0)
+
+        # 7. Reboot phase
+        log.info("[%s %d] Rebooting VM...", log_prefix, iteration_num)
+        reboot_start = time.time()
+        reboot_start_ts = datetime.now().isoformat()
+
+        ssh.run("systemctl reboot", timeout=10)
+        ssh.close()
+
+        # Wait for SSH to go down, then come back up
+        wait_for_ssh_down(vm_ip)
+        time.sleep(5)  # Grace period
+
+        ssh = SSH(vm_ip, str(ssh_key_path))
+        ssh.connect(timeout=SSH_TIMEOUT_SEC)
+
+        reboot_end = time.time()
+        reboot_end_ts = datetime.now().isoformat()
+        reboot_duration = reboot_end - reboot_start
+
+        result.reboot_phase = PhaseResult(
+            name="reboot",
+            duration_sec=round(reboot_duration, 2),
+            start_time=reboot_start_ts,
+            end_time=reboot_end_ts,
+        )
+
+        log.info("[%s %d] Reboot phase completed in %.1fs",
+                 log_prefix, iteration_num, reboot_duration)
+
+        # 8. Post-upgrade stats
+        log.info("[%s %d] Collecting post-upgrade stats...", log_prefix,
+                 iteration_num)
+        result.post_upgrade = {
+            "bootc_status": collect_bootc_status(ssh),
+            "disk_usage": collect_disk_usage(ssh),
+        }
+
+        # Compute disk delta
+        pre_used = result.pre_upgrade.get("disk_usage", {}).get(
+            "used_bytes", 0)
+        post_used = result.post_upgrade.get("disk_usage", {}).get(
+            "used_bytes", 0)
+        if pre_used and post_used:
+            result.disk_delta_bytes = post_used - pre_used
+
+        # Total duration
+        result.total_duration_sec = round(
+            extra_duration + stage_duration + reboot_duration, 2)
+
+        # 9. Stop monitor and collect samples
+        samples = monitor.stop()
+        result.cpu_samples = [asdict(s) for s in samples]
+        result.memory_samples = [
+            {
+                "timestamp": s.timestamp,
+                "rss_kb": s.memory_rss_kb,
+                "available_kb": s.memory_available_kb,
+            }
+            for s in samples
+        ]
+
+        completion_log_fn(stage_duration, reboot_duration,
+                          result.total_duration_sec)
+
+    except Exception as e:
+        result.error = str(e)
+        log.error("[%s %d] Failed: %s", log_prefix, iteration_num, e,
+                  exc_info=True)
+
+    finally:
+        # Cleanup
+        if ssh:
+            ssh.close()
+        if dom:
+            vm_mgr.destroy_vm(dom)
+        if disk_path.exists():
+            disk_path.unlink(missing_ok=True)
+            log.debug("Deleted disk %s", disk_path)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Single iteration – baseline / gzip / zstd modes
 # ---------------------------------------------------------------------------
 
 def run_iteration(
@@ -921,56 +1089,19 @@ def run_iteration(
     """Run a single benchmark iteration."""
     result = IterationResult(iteration=iteration_num, mode=mode)
     vm_name = f"bootc-bench-{iteration_num}-{uuid.uuid4().hex[:8]}"
-    disk_path = work_dir / f"{vm_name}.qcow2"
-    dom = None
-    ssh = None
 
-    try:
-        # 1. Copy base qcow2
-        log.info("[Iter %d] Copying base qcow2...", iteration_num)
-        subprocess.run(
-            NICE_PREFIX + ["cp", str(base_qcow2), str(disk_path)],
-            check=True,
-        )
+    # Pre-populate layer info (collected once per target)
+    if target_layer_info:
+        result.layer_details = target_layer_info.get("layers", [])
+        result.layers_pulled = target_layer_info.get("layer_count")
+        result.download_size_bytes = target_layer_info.get(
+            "total_compressed_size_bytes")
 
-        # Resize disk to ensure enough space for upgrade
-        subprocess.run(
-            NICE_PREFIX + ["qemu-img", "resize", str(disk_path),
-             f"{DEFAULT_VM_DISK_GB}G"],
-            check=True, capture_output=True,
-        )
-
-        # 2. Create and start VM
-        log.info("[Iter %d] Starting VM %s...", iteration_num, vm_name)
-        dom = vm_mgr.create_vm(vm_name, str(disk_path),
-                               memory_mb=vm_memory_mb, vcpus=vm_vcpus)
-
-        # 3. Get VM IP and connect via SSH
-        vm_ip = vm_mgr.get_vm_ip(dom)
-        ssh = SSH(vm_ip, str(ssh_key_path))
-        ssh.connect()
-
-        # 4. Copy registry credentials
+    def upgrade_fn(ssh: SSH) -> float:
+        # Copy registry credentials (needed for remote pull)
         copy_registry_auth(ssh)
 
-        # 5. Pre-upgrade baseline
-        log.info("[Iter %d] Collecting pre-upgrade baseline...", iteration_num)
-        result.pre_upgrade = {
-            "bootc_status": collect_bootc_status(ssh),
-            "disk_usage": collect_disk_usage(ssh),
-        }
-
-        # Use pre-collected layer info (collected once per target)
-        if target_layer_info:
-            result.layer_details = target_layer_info.get("layers", [])
-            result.layers_pulled = target_layer_info.get("layer_count")
-            result.download_size_bytes = target_layer_info.get("total_compressed_size_bytes")
-
-        # 6. Start resource monitor
-        monitor = ResourceMonitor(vm_mgr, dom)
-        monitor.start()
-
-        # 7. Stage phase: run bootc switch
+        # Stage phase: run bootc switch
         log.info("[Iter %d] Running bootc switch to %s...",
                  iteration_num, target_image)
         stage_start = time.time()
@@ -1007,90 +1138,32 @@ def run_iteration(
         if rc != 0:
             result.error = f"bootc switch failed (rc={rc}): {out}"
             log.error("[Iter %d] %s", iteration_num, result.error)
-            monitor.stop()
-            return result
+            return 0.0
 
         log.info("[Iter %d] Stage phase completed in %.1fs",
                  iteration_num, stage_duration)
+        return 0.0  # no extra duration beyond stage + reboot
 
-        # 8. Reboot phase
-        log.info("[Iter %d] Rebooting VM...", iteration_num)
-        reboot_start = time.time()
-        reboot_start_ts = datetime.now().isoformat()
-
-        ssh.run("systemctl reboot", timeout=10)
-        ssh.close()
-
-        # Wait for SSH to go down, then come back up
-        wait_for_ssh_down(vm_ip)
-        time.sleep(5)  # Grace period
-
-        ssh = SSH(vm_ip, str(ssh_key_path))
-        ssh.connect(timeout=SSH_TIMEOUT_SEC)
-
-        reboot_end = time.time()
-        reboot_end_ts = datetime.now().isoformat()
-        reboot_duration = reboot_end - reboot_start
-
-        result.reboot_phase = PhaseResult(
-            name="reboot",
-            duration_sec=round(reboot_duration, 2),
-            start_time=reboot_start_ts,
-            end_time=reboot_end_ts,
-        )
-
-        log.info("[Iter %d] Reboot phase completed in %.1fs",
-                 iteration_num, reboot_duration)
-
-        # 9. Post-upgrade stats
-        log.info("[Iter %d] Collecting post-upgrade stats...", iteration_num)
-        result.post_upgrade = {
-            "bootc_status": collect_bootc_status(ssh),
-            "disk_usage": collect_disk_usage(ssh),
-        }
-
-        # Compute disk delta
-        pre_used = result.pre_upgrade.get("disk_usage", {}).get("used_bytes", 0)
-        post_used = result.post_upgrade.get("disk_usage", {}).get("used_bytes", 0)
-        if pre_used and post_used:
-            result.disk_delta_bytes = post_used - pre_used
-
-        # Total duration
-        result.total_duration_sec = round(stage_duration + reboot_duration, 2)
-
-        # 10. Stop monitor and collect samples
-        samples = monitor.stop()
-        result.cpu_samples = [asdict(s) for s in samples]
-        result.memory_samples = [
-            {
-                "timestamp": s.timestamp,
-                "rss_kb": s.memory_rss_kb,
-                "available_kb": s.memory_available_kb,
-            }
-            for s in samples
-        ]
-
+    def completion_log_fn(stage_dur, reboot_dur, total_dur):
         log.info(
             "[Iter %d] Complete — stage=%.1fs reboot=%.1fs total=%.1fs",
-            iteration_num, stage_duration, reboot_duration,
-            result.total_duration_sec,
+            iteration_num, stage_dur, reboot_dur, total_dur,
         )
 
-    except Exception as e:
-        result.error = str(e)
-        log.error("[Iter %d] Failed: %s", iteration_num, e, exc_info=True)
-
-    finally:
-        # Cleanup
-        if ssh:
-            ssh.close()
-        if dom:
-            vm_mgr.destroy_vm(dom)
-        if disk_path.exists():
-            disk_path.unlink(missing_ok=True)
-            log.debug("Deleted disk %s", disk_path)
-
-    return result
+    return _run_iteration_lifecycle(
+        iteration_num=iteration_num,
+        base_qcow2=base_qcow2,
+        ssh_key_path=ssh_key_path,
+        vm_mgr=vm_mgr,
+        work_dir=work_dir,
+        vm_memory_mb=vm_memory_mb,
+        vm_vcpus=vm_vcpus,
+        result=result,
+        vm_name=vm_name,
+        log_prefix="Iter",
+        upgrade_fn=upgrade_fn,
+        completion_log_fn=completion_log_fn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1431,9 +1504,6 @@ def run_iteration_delta(
     """Run a single benchmark iteration using oci-delta."""
     result = IterationResult(iteration=iteration_num, mode="delta")
     vm_name = f"bootc-bench-delta-{iteration_num}-{uuid.uuid4().hex[:8]}"
-    disk_path = work_dir / f"{vm_name}.qcow2"
-    dom = None
-    ssh = None
 
     delta_file = Path(delta_artifacts["delta_file"])
     result.delta_file_size_bytes = delta_artifacts["delta_size_bytes"]
@@ -1444,37 +1514,11 @@ def run_iteration_delta(
         result.layers_pulled = target_layer_info.get("layer_count")
         result.download_size_bytes = delta_artifacts["delta_size_bytes"]
 
-    try:
-        # 1. Copy base qcow2
-        log.info("[Delta Iter %d] Copying base qcow2...", iteration_num)
-        subprocess.run(NICE_PREFIX + ["cp", str(base_qcow2), str(disk_path)], check=True)
-        subprocess.run(
-            NICE_PREFIX + ["qemu-img", "resize", str(disk_path), f"{DEFAULT_VM_DISK_GB}G"],
-            check=True, capture_output=True,
-        )
+    # Track durations across sub-phases for the completion log
+    extra_durations = {}
 
-        # 2. Create and start VM
-        log.info("[Delta Iter %d] Starting VM %s...", iteration_num, vm_name)
-        dom = vm_mgr.create_vm(vm_name, str(disk_path),
-                               memory_mb=vm_memory_mb, vcpus=vm_vcpus)
-
-        # 3. Get VM IP and connect via SSH
-        vm_ip = vm_mgr.get_vm_ip(dom)
-        ssh = SSH(vm_ip, str(ssh_key_path))
-        ssh.connect()
-
-        # 4. Pre-upgrade baseline
-        log.info("[Delta Iter %d] Collecting pre-upgrade baseline...", iteration_num)
-        result.pre_upgrade = {
-            "bootc_status": collect_bootc_status(ssh),
-            "disk_usage": collect_disk_usage(ssh),
-        }
-
-        # 5. Start resource monitor
-        monitor = ResourceMonitor(vm_mgr, dom)
-        monitor.start()
-
-        # 6. Transfer delta file + oci-delta binary + supplement into VM
+    def upgrade_fn(ssh: SSH) -> float:
+        # 1. Transfer delta file + oci-delta binary + supplement into VM
         supplement_file = delta_artifacts.get("supplement_file")
         log.info("[Delta Iter %d] Transferring delta (%.1f MB) and oci-delta binary...",
                  iteration_num, delta_file.stat().st_size / 1024**2)
@@ -1499,7 +1543,7 @@ def run_iteration_delta(
         log.info("[Delta Iter %d] Transfer completed in %.1fs",
                  iteration_num, transfer_duration)
 
-        # 7. Apply delta → reconstruct OCI archive
+        # 2. Apply delta → reconstruct OCI archive
         log.info("[Delta Iter %d] Applying delta...", iteration_num)
         apply_start = time.time()
         apply_start_ts = datetime.now().isoformat()
@@ -1524,13 +1568,12 @@ def run_iteration_delta(
         if rc != 0:
             result.error = f"oci-delta apply failed (rc={rc}): {out}"
             log.error("[Delta Iter %d] %s", iteration_num, result.error)
-            monitor.stop()
-            return result
+            return 0.0
 
         log.info("[Delta Iter %d] Delta apply completed in %.1fs",
                  iteration_num, apply_duration)
 
-        # 7b. Inject any skipped blobs (oci-delta bug workaround)
+        # 2b. Inject any skipped blobs (oci-delta bug workaround)
         if supplement_file:
             log.info("[Delta Iter %d] Injecting supplement blobs...", iteration_num)
             # The supplement tar contains blobs at their OCI paths
@@ -1549,7 +1592,7 @@ def run_iteration_delta(
                 log.warning("[Delta Iter %d] Supplement injection returned rc=%d: %s",
                             iteration_num, rc, out)
 
-        # 8. Stage phase: bootc switch to local OCI archive
+        # 3. Stage phase: bootc switch to local OCI archive
         log.info("[Delta Iter %d] Running bootc switch (oci-archive)...", iteration_num)
         stage_start = time.time()
         stage_start_ts = datetime.now().isoformat()
@@ -1577,84 +1620,41 @@ def run_iteration_delta(
         if rc != 0:
             result.error = f"bootc switch failed (rc={rc}): {out}"
             log.error("[Delta Iter %d] %s", iteration_num, result.error)
-            monitor.stop()
-            return result
+            return 0.0
 
         log.info("[Delta Iter %d] Stage phase completed in %.1fs",
                  iteration_num, stage_duration)
 
-        # 9. Reboot phase
-        log.info("[Delta Iter %d] Rebooting VM...", iteration_num)
-        reboot_start = time.time()
-        reboot_start_ts = datetime.now().isoformat()
+        # Stash sub-phase durations for the completion log
+        extra_durations["transfer"] = transfer_duration
+        extra_durations["apply"] = apply_duration
 
-        ssh.run("systemctl reboot", timeout=10)
-        ssh.close()
+        return transfer_duration + apply_duration
 
-        wait_for_ssh_down(vm_ip)
-        time.sleep(5)
-
-        ssh = SSH(vm_ip, str(ssh_key_path))
-        ssh.connect(timeout=SSH_TIMEOUT_SEC)
-
-        reboot_end = time.time()
-        reboot_duration = reboot_end - reboot_start
-
-        result.reboot_phase = PhaseResult(
-            name="reboot",
-            duration_sec=round(reboot_duration, 2),
-            start_time=reboot_start_ts,
-            end_time=datetime.now().isoformat(),
-        )
-        log.info("[Delta Iter %d] Reboot completed in %.1fs",
-                 iteration_num, reboot_duration)
-
-        # 10. Post-upgrade stats
-        log.info("[Delta Iter %d] Collecting post-upgrade stats...", iteration_num)
-        result.post_upgrade = {
-            "bootc_status": collect_bootc_status(ssh),
-            "disk_usage": collect_disk_usage(ssh),
-        }
-
-        pre_used = result.pre_upgrade.get("disk_usage", {}).get("used_bytes", 0)
-        post_used = result.post_upgrade.get("disk_usage", {}).get("used_bytes", 0)
-        if pre_used and post_used:
-            result.disk_delta_bytes = post_used - pre_used
-
-        # Total = transfer + apply + stage + reboot
-        result.total_duration_sec = round(
-            transfer_duration + apply_duration + stage_duration + reboot_duration, 2
-        )
-
-        # Stop monitor
-        samples = monitor.stop()
-        result.cpu_samples = [asdict(s) for s in samples]
-        result.memory_samples = [
-            {"timestamp": s.timestamp, "rss_kb": s.memory_rss_kb,
-             "available_kb": s.memory_available_kb}
-            for s in samples
-        ]
-
+    def completion_log_fn(stage_dur, reboot_dur, total_dur):
         log.info(
             "[Delta Iter %d] Complete — transfer=%.1fs apply=%.1fs "
             "stage=%.1fs reboot=%.1fs total=%.1fs",
-            iteration_num, transfer_duration, apply_duration,
-            stage_duration, reboot_duration, result.total_duration_sec,
+            iteration_num,
+            extra_durations.get("transfer", 0.0),
+            extra_durations.get("apply", 0.0),
+            stage_dur, reboot_dur, total_dur,
         )
 
-    except Exception as e:
-        result.error = str(e)
-        log.error("[Delta Iter %d] Failed: %s", iteration_num, e, exc_info=True)
-
-    finally:
-        if ssh:
-            ssh.close()
-        if dom:
-            vm_mgr.destroy_vm(dom)
-        if disk_path.exists():
-            disk_path.unlink(missing_ok=True)
-
-    return result
+    return _run_iteration_lifecycle(
+        iteration_num=iteration_num,
+        base_qcow2=base_qcow2,
+        ssh_key_path=ssh_key_path,
+        vm_mgr=vm_mgr,
+        work_dir=work_dir,
+        vm_memory_mb=vm_memory_mb,
+        vm_vcpus=vm_vcpus,
+        result=result,
+        vm_name=vm_name,
+        log_prefix="Delta Iter",
+        upgrade_fn=upgrade_fn,
+        completion_log_fn=completion_log_fn,
+    )
 
 
 # ---------------------------------------------------------------------------
