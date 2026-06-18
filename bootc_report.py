@@ -10,6 +10,7 @@ import argparse
 import html
 import json
 import os
+import re
 import sys
 import textwrap
 from datetime import datetime
@@ -224,8 +225,8 @@ def build_iteration_table(bench: dict) -> str:
             <td>{format_duration(stage.get('duration_sec'))}</td>
             <td>{format_duration(reboot.get('duration_sec'))}</td>
             <td>{format_duration(it.get('total_duration_sec'))}</td>
-            <td>{parsed.get('download_size_human', 'N/A')}</td>
-            <td>{parsed.get('deploy_duration_sec', 'N/A')}s</td>
+            <td>{html.escape(str(parsed.get('download_size_human', 'N/A')))}</td>
+            <td>{format_duration(parsed.get('deploy_duration_sec'))}</td>
             <td>{format_bytes(it.get('disk_delta_bytes'))}</td>
             <td>{'✅' if it.get('error') is None else '❌'}</td>
         </tr>""")
@@ -375,7 +376,7 @@ def generate_html(data: dict) -> str:
         bench_mode = get_mode(bench)
         label = short_image_ref(bench["target_image"])
         chart_label = label + (" (delta)" if bench_mode == "delta" else "")
-        safe_id = chart_label.replace(":", "-").replace("/", "-").replace(" ", "-").replace("(", "").replace(")", "")
+        safe_id = re.sub(r'[^a-zA-Z0-9_-]', '-', chart_label)
         iter_table = build_iteration_table(bench)
 
         # Delta artifacts
@@ -645,7 +646,7 @@ def generate_html(data: dict) -> str:
         </div>
 
         <script>
-        const chartData = {json.dumps(chart_data)};
+        const chartData = {json.dumps(chart_data).replace("</", "<\\/")};
         const hasDelta = {json.dumps(show_delta)};
 
         Chart.defaults.color = '#8b949e';
