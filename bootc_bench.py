@@ -317,16 +317,16 @@ class VMManager:
             sample.memory_rss_kb = stats.get("rss", 0)
             sample.memory_available_kb = stats.get("available", 0)
             sample.memory_used_kb = stats.get("rss", 0)
-        except libvirt.libvirtError:
-            pass
+        except libvirt.libvirtError as e:
+            log.debug("Failed to collect memory stats: %s", e)
 
         try:
             # CPU stats: array of per-vcpu stats + total
             info = dom.info()
             # info[4] is CPU time in nanoseconds
             sample.cpu_time_ns = info[4] if len(info) > 4 else 0
-        except libvirt.libvirtError:
-            pass
+        except libvirt.libvirtError as e:
+            log.debug("Failed to collect CPU stats: %s", e)
 
         return sample
 
@@ -336,8 +336,8 @@ class VMManager:
         try:
             if dom.isActive():
                 dom.destroy()
-        except libvirt.libvirtError:
-            pass
+        except libvirt.libvirtError as e:
+            log.debug("Failed to destroy VM %s: %s", name, e)
         try:
             dom.undefineFlags(
                 libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
@@ -346,8 +346,8 @@ class VMManager:
         except libvirt.libvirtError:
             try:
                 dom.undefine()
-            except libvirt.libvirtError:
-                pass
+            except libvirt.libvirtError as e:
+                log.debug("Failed to undefine VM %s: %s", name, e)
         log.info("VM %s destroyed", name)
 
     def reboot_vm(self, dom: libvirt.virDomain):
