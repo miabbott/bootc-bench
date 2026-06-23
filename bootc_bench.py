@@ -539,6 +539,49 @@ def push_to_local_registry(
     log.info("Pushed %s", tag)
 
 
+def _push_local_image_to_registry(
+    local_tag: str,
+    registry_tag: str,
+    compress_format: Optional[str] = None,
+) -> None:
+    """Push an image from local (root) podman storage to the local registry."""
+    dest = f"docker://localhost:{REGISTRY_HOST_PORT}/{registry_tag}"
+    cmd = NICE_PREFIX + [
+        "sudo", "skopeo", "copy",
+        "--dest-tls-verify=false",
+    ]
+    if compress_format:
+        cmd.extend(["--dest-compress-format", compress_format])
+    cmd.extend([f"containers-storage:{local_tag}", dest])
+
+    log.info("Pushing local image %s to registry as %s...", local_tag, registry_tag)
+    subprocess.run(cmd, check=True)
+    log.info("Pushed %s", registry_tag)
+
+
+def _get_local_image_layer_info(local_tag: str) -> dict:
+    """Collect layer info from a local (root) podman image."""
+    try:
+        result = subprocess.run(
+            ["sudo", "skopeo", "inspect", f"containers-storage:{local_tag}"],
+            capture_output=True, text=True, check=True,
+        )
+        inspect_data = json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        return {"error": str(e)}
+
+    # skopeo inspect on containers-storage doesn't give layer details in the
+    # same way as a registry manifest. Get what we can.
+    layers = inspect_data.get("Layers", [])
+    return {
+        "layer_count": len(layers),
+        "total_compressed_size_bytes": 0,  # Not available from local storage
+        "layers": [],
+        "digest": inspect_data.get("Digest", ""),
+        "labels": inspect_data.get("Labels", {}),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Image builder
 # ---------------------------------------------------------------------------
