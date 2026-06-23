@@ -659,6 +659,153 @@ def build_base_qcow2(
     return qcow2_path
 
 
+def build_customized_image(
+    base_image: str,
+    packages: list[str],
+    tag: str,
+    ssh_pub_key_path: Optional[Path] = None,
+    inject_bench_config: bool = True,
+) -> str:
+    """Build a customized container image with packages layered on top.
+
+    Args:
+        base_image: Base container image reference (e.g. registry.redhat.io/rhel9/rhel-bootc:9.6-xxx)
+        packages: List of RPM package names to install
+        tag: Local tag for the built image (e.g. localhost/bootc-bench-custom-base:latest)
+        ssh_pub_key_path: Path to SSH public key to inject (for base images only)
+        inject_bench_config: Whether to inject SSH key and insecure registry config
+
+    Returns the tag of the built image.
+    """
+    with tempfile.TemporaryDirectory(prefix="bootc-bench-custom-") as build_dir_str:
+        build_dir = Path(build_dir_str)
+
+        # Build Containerfile
+        lines = [f"FROM {base_image}"]
+
+        if packages:
+            pkg_str = " ".join(packages)
+            lines.append(f"RUN dnf install -y {pkg_str} && dnf clean all")
+
+        if inject_bench_config and ssh_pub_key_path:
+            shutil.copy2(ssh_pub_key_path, build_dir / "authorized_keys")
+            lines.extend([
+                "RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+                "COPY authorized_keys /root/.ssh/authorized_keys",
+                "RUN chmod 600 /root/.ssh/authorized_keys",
+                "RUN systemctl enable sshd",
+                f'RUN printf \'[[registry]]\\nlocation = "{LIBVIRT_HOST_IP}:{REGISTRY_HOST_PORT}"\\ninsecure = true\\n\' '
+                f'> /etc/containers/registries.conf.d/bootc-bench-local.conf',
+            ])
+
+        containerfile = build_dir / "Containerfile"
+        containerfile.write_text("\n".join(lines) + "\n")
+
+        log.info("Building customized image: %s (packages: %s)", tag, ", ".join(packages))
+
+        authfile = _find_authfile()
+        build_cmd = NICE_PREFIX + ["sudo", "podman", "build"]
+        if authfile:
+            build_cmd.append(f"--authfile={authfile}")
+        build_cmd.extend(["-t", tag, "-f", str(containerfile), str(build_dir)])
+
+        subprocess.run(build_cmd, check=True)
+        log.info("Built customized image: %s", tag)
+
+    return tag
+
+
+def build_customized_qcow2(
+    base_image: str,
+    packages: list[str],
+    output_dir: Path,
+    ssh_pub_key_path: Path,
+) -> Path:
+    """Build a qcow2 from a customized (packages-layered) base image.
+
+    Similar to build_base_qcow2 but installs packages first, then
+    bakes in the SSH key and registry config.
+
+    Returns path to the qcow2 file.
+    """
+    cache_key = safe_name(base_image)
+    qcow2_path = output_dir / f"customized-base-{cache_key}.qcow2"
+    if qcow2_path.exists():
+        log.info("Customized base qcow2 already exists at %s", qcow2_path)
+        return qcow2_path
+
+    derived_tag = "localhost/bootc-bench-custom-base:latest"
+    build_customized_image(
+        base_image, packages, derived_tag,
+        ssh_pub_key_path=ssh_pub_key_path,
+        inject_bench_config=True,
+    )
+
+    # Run bootc-image-builder
+    bib_output = output_dir / "bib-output-customized"
+    bib_output.mkdir(parents=True, exist_ok=True)
+
+    authfile = _find_authfile()
+    log.info("Running bootc-image-builder for customized base (this may take several minutes)...")
+    bib_cmd = NICE_PREFIX + [
+        "sudo", "podman", "run",
+        "--rm", "--privileged", "--pull=newer",
+        f"--authfile={authfile}" if authfile else None,
+        "-v", f"{bib_output}:/output",
+        "-v", "/var/lib/containers/storage:/var/lib/containers/storage",
+    ]
+    bib_cmd = [x for x in bib_cmd if x is not None]
+    if authfile:
+        bib_cmd.extend(["-v", f"{authfile}:/run/containers/0/auth.json:ro"])
+    bib_cmd.extend([BIB_IMAGE, "--type", "qcow2", "--local", derived_tag])
+    subprocess.run(bib_cmd, check=True)
+
+    built_qcow2 = bib_output / "qcow2" / "disk.qcow2"
+    if not built_qcow2.exists():
+        raise FileNotFoundError(
+            f"bootc-image-builder did not produce expected output at {built_qcow2}"
+        )
+
+    subprocess.run(["sudo", "chown", f"{os.getuid()}:{os.getgid()}",
+                    str(built_qcow2)], check=True)
+    shutil.copy2(str(built_qcow2), str(qcow2_path))
+    log.info("Customized base qcow2 ready: %s", qcow2_path)
+    return qcow2_path
+
+
+def build_customized_target(
+    target_image: str,
+    packages: list[str],
+    cache_dir: Path,
+) -> str:
+    """Build a customized target image (packages layered on the target).
+
+    The target image doesn't need SSH key or bench config -- it's just
+    the upgrade destination. Only packages are layered.
+
+    Returns the local image tag.
+    """
+    # Create a deterministic tag from the target ref
+    safe = safe_name(target_image)
+    tag = f"localhost/bootc-bench-custom-target:{safe}"
+
+    # Check if already built in podman storage
+    rc = subprocess.run(
+        ["sudo", "podman", "image", "exists", tag],
+        capture_output=True,
+    ).returncode
+    if rc == 0:
+        log.info("Customized target already built: %s", tag)
+        return tag
+
+    build_customized_image(
+        target_image, packages, tag,
+        ssh_pub_key_path=None,
+        inject_bench_config=False,
+    )
+    return tag
+
+
 # ---------------------------------------------------------------------------
 # Upgrade stats collection
 # ---------------------------------------------------------------------------
