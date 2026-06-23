@@ -630,7 +630,10 @@ def build_base_qcow2(
 
     Returns the path to the qcow2 file.
     """
-    qcow2_path = output_dir / "base.qcow2"
+    # Include the base image in the cache filename so different base images
+    # don't collide (e.g. switching from 9.6 to 9.8 base).
+    cache_key = safe_name(base_image)
+    qcow2_path = output_dir / f"base-{cache_key}.qcow2"
     if qcow2_path.exists():
         log.info("Base qcow2 already exists at %s", qcow2_path)
         return qcow2_path
