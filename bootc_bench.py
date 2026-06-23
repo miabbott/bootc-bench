@@ -60,6 +60,50 @@ MONITOR_INTERVAL_SEC = 2
 SSH_TIMEOUT_SEC = 300
 SSH_PORT = 22
 
+DEFAULT_PACKAGES = [
+    "httpd", "postgresql-server", "vim-enhanced", "tmux",
+    "git", "make", "python3-pip", "bind-utils",
+]
+
+DEFAULT_IMAGE_REPO = "registry.redhat.io/rhel9/rhel-bootc"
+
+
+# ---------------------------------------------------------------------------
+# Tag discovery
+# ---------------------------------------------------------------------------
+
+def discover_zstream_tags(image_repo: str, y_stream: str) -> tuple[str, str]:
+    """Discover the oldest and newest build tags for a y-stream.
+
+    Queries the registry via skopeo list-tags and filters for tags
+    matching the pattern '{y_stream}-{timestamp}' (excluding '-source' tags).
+
+    Returns (oldest_tag, newest_tag) as full image references.
+    """
+    result = subprocess.run(
+        ["skopeo", "list-tags", f"docker://{image_repo}"],
+        capture_output=True, text=True, check=True,
+    )
+    all_tags = json.loads(result.stdout).get("Tags", [])
+
+    build_tags = sorted([
+        t for t in all_tags
+        if re.match(rf'^{re.escape(y_stream)}-\d+$', t)
+    ])
+
+    if not build_tags:
+        raise ValueError(
+            f"No build tags found for {image_repo} y-stream {y_stream}. "
+            f"Available tags with prefix '{y_stream}': "
+            f"{[t for t in all_tags if t.startswith(y_stream)][:10]}"
+        )
+
+    oldest = f"{image_repo}:{build_tags[0]}"
+    newest = f"{image_repo}:{build_tags[-1]}"
+    log.info("Z-stream range for %s: %s → %s (%d builds)",
+             y_stream, build_tags[0], build_tags[-1], len(build_tags))
+    return oldest, newest
+
 
 # ---------------------------------------------------------------------------
 # Data classes
