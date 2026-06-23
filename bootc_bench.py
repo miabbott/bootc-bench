@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import statistics
@@ -465,7 +466,6 @@ def push_to_local_registry(
     # Check if already pushed by querying the registry
     repo, ref = tag.split(":", 1) if ":" in tag else (tag, "latest")
     try:
-        import urllib.request, urllib.error
         url = f"http://localhost:{REGISTRY_HOST_PORT}/v2/{repo}/manifests/{ref}"
         req = urllib.request.Request(url, headers={
             "Accept": "application/vnd.oci.image.manifest.v1+json,"
@@ -656,7 +656,6 @@ def parse_bootc_switch_output(output: str) -> dict:
           Version: 9.8
           Digest: sha256:600858c0...
     """
-    import re
     info = {"raw_output": output}
     lines = output.strip().splitlines()
     info["output_lines"] = lines
@@ -1255,6 +1254,11 @@ def format_bytes(b: int | float) -> str:
 def safe_name(ref: str) -> str:
     """Sanitize an image reference for use in filenames."""
     return ref.split("/")[-1].replace(":", "-")
+
+
+def short_ref(ref: str) -> str:
+    """Shorten an image reference for log messages."""
+    return ref.split("/")[-1] if "/" in ref else ref
 
 
 def _create_blob_supplement(
