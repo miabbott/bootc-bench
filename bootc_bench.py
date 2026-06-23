@@ -1687,17 +1687,30 @@ def prepare_delta_artifacts(
     old_image_ref = derived_image or base_image
     old_from_local = derived_image is not None
 
-    old_label = "derived" if old_from_local else safe_name(base_image)
+    # Use distinct labels for vanilla vs customized to avoid archive collisions
+    if old_from_local and derived_image and "custom" in derived_image:
+        old_label = "customized-derived"
+    elif old_from_local:
+        old_label = "derived"
+    else:
+        old_label = safe_name(base_image)
     old_archive = archives_dir / f"{old_label}.oci-archive"
     new_archive = archives_dir / f"{safe_name(target_image)}.oci-archive"
     delta_file = archives_dir / f"{old_label}-to-{safe_name(target_image)}.delta"
+
+    # Detect whether the target image is in local podman storage
+    # (customized targets start with "localhost/")
+    new_from_local = target_image.startswith("localhost/")
 
     # Export both images
     old_export_time = export_oci_archive(
         old_image_ref, old_archive, authfile,
         from_local_storage=old_from_local,
     )
-    new_export_time = export_oci_archive(target_image, new_archive, authfile)
+    new_export_time = export_oci_archive(
+        target_image, new_archive, authfile,
+        from_local_storage=new_from_local,
+    )
 
     # Create delta
     delta_time, delta_size = create_delta(
