@@ -151,6 +151,8 @@ class IterationResult:
     delta_file_size_bytes: Optional[int] = None
     delta_apply_output: str = ""
     mode: str = "baseline"
+    variant: str = "vanilla"        # "vanilla" or "customized"
+    upgrade_type: str = "y-stream"  # "z-stream" or "y-stream"
     cpu_samples: list = field(default_factory=list)
     memory_samples: list = field(default_factory=list)
     error: Optional[str] = None
