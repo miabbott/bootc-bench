@@ -1,19 +1,21 @@
 #!/bin/bash
-# Full 3-target × 3-mode comparison benchmark
-# Scheduled to run at 18:00 on 2026-06-17
+# Full realistic upgrade comparison benchmark
 #
-# Targets: rhel-bootc 9.8, 10.0, 10.2 (from 9.6 base)
-# Modes:   baseline-gzip, baseline-zstd, delta
-# Iterations: 5 per target per mode
+# Runs all 3 modes (baseline-gzip, baseline-zstd, delta) with z-stream
+# and y-stream upgrades, both vanilla and customized (package-layered).
+#
+# Usage:
+#   ./run-full-comparison.sh                    # defaults: 9.6 base, 9.8 y-stream target
+#   ./run-full-comparison.sh 9.6 9.8            # explicit base stream + y-stream target
+#   ./run-full-comparison.sh 9.6 9.8 --no-customize  # skip customized variants
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-TARGETS=(
-    registry.redhat.io/rhel9/rhel-bootc:9.8
-    registry.redhat.io/rhel10/rhel-bootc:10.0
-    registry.redhat.io/rhel10/rhel-bootc:10.2
-)
+BASE_STREAM="${1:-9.6}"
+YSTREAM_TARGET="${2:-registry.redhat.io/rhel9/rhel-bootc:9.8}"
+shift 2 2>/dev/null || true
+EXTRA_ARGS=("$@")
 
 ITERATIONS=5
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -26,9 +28,11 @@ log() {
 }
 
 log "=== Full comparison benchmark ==="
-log "Targets: ${TARGETS[*]}"
+log "Base stream: $BASE_STREAM"
+log "Y-stream target: $YSTREAM_TARGET"
 log "Modes: baseline-gzip, baseline-zstd, delta"
 log "Iterations: $ITERATIONS"
+log "Extra args: ${EXTRA_ARGS[*]:-none}"
 log "Output: $OUTDIR"
 log ""
 
@@ -42,12 +46,19 @@ fi
 
 FAILED=0
 
+# Common args for all runs
+COMMON_ARGS=(
+    --base-stream "$BASE_STREAM"
+    -t "$YSTREAM_TARGET"
+    -n "$ITERATIONS"
+    "${EXTRA_ARGS[@]}"
+)
+
 # --- Run 1: baseline-gzip ---
 log "========== RUN 1/3: baseline-gzip =========="
 if python3 bootc_bench.py \
     -m baseline-gzip \
-    -t "${TARGETS[@]}" \
-    -n "$ITERATIONS" \
+    "${COMMON_ARGS[@]}" \
     -o "${OUTDIR}/gzip" \
     2>&1 | tee -a "$LOGFILE"; then
     log "baseline-gzip: DONE"
@@ -61,8 +72,7 @@ log ""
 log "========== RUN 2/3: baseline-zstd =========="
 if python3 bootc_bench.py \
     -m baseline-zstd \
-    -t "${TARGETS[@]}" \
-    -n "$ITERATIONS" \
+    "${COMMON_ARGS[@]}" \
     -o "${OUTDIR}/zstd" \
     2>&1 | tee -a "$LOGFILE"; then
     log "baseline-zstd: DONE"
@@ -76,8 +86,7 @@ log ""
 log "========== RUN 3/3: delta =========="
 if python3 bootc_bench.py \
     -m delta \
-    -t "${TARGETS[@]}" \
-    -n "$ITERATIONS" \
+    "${COMMON_ARGS[@]}" \
     -o "${OUTDIR}/delta" \
     2>&1 | tee -a "$LOGFILE"; then
     log "delta: DONE"
@@ -109,7 +118,11 @@ first = next(iter(runs.values()))
 combined = {
     'config': {
         'base_image': first['config']['base_image'],
-        'targets': first['config']['targets'],
+        'base_stream': first['config'].get('base_stream'),
+        'zstream_target': first['config'].get('zstream_target'),
+        'ystream_targets': first['config'].get('ystream_targets', []),
+        'packages': first['config'].get('packages'),
+        'customize': first['config'].get('customize', False),
         'iterations': first['config']['iterations'],
         'vm_memory_mb': first['config']['vm_memory_mb'],
         'vm_vcpus': first['config']['vm_vcpus'],
@@ -152,26 +165,29 @@ if not os.path.exists(path):
 data = json.load(open(path))
 benchmarks = data['benchmarks']
 
-# Group by target
+# Group by target + variant + upgrade_type
 from collections import defaultdict
-by_target = defaultdict(dict)
+by_key = defaultdict(dict)
 for b in benchmarks:
     target = b['target_image'].split('/')[-1]
+    variant = b.get('variant', 'vanilla')
+    utype = b.get('upgrade_type', 'y-stream')
     mode = b['mode']
     total = b.get('summary', {}).get('total_duration_sec', {})
     mean = total.get('mean', 'N/A') if isinstance(total, dict) else 'N/A'
     success = b.get('summary', {}).get('successful_iterations', 0)
     total_iters = success + b.get('summary', {}).get('failed_iterations', 0)
-    by_target[target][mode] = (mean, success, total_iters)
+    key = f'{target} [{utype[:1]}] [{variant[:3]}]'
+    by_key[key][mode] = (mean, success, total_iters)
 
 print()
-print(f'{\"Target\":>20} {\"Gzip\":>14} {\"zstd:chunked\":>14} {\"Delta\":>14}')
-print('-' * 66)
-for target in sorted(by_target):
-    row = f'{target:>20}'
+print(f'{\"Scenario\":>35} {\"Gzip\":>14} {\"zstd:chunked\":>14} {\"Delta\":>14}')
+print('-' * 81)
+for key in sorted(by_key):
+    row = f'{key:>35}'
     for mode in ('baseline-gzip', 'baseline-zstd', 'delta'):
-        if mode in by_target[target]:
-            mean, ok, tot = by_target[target][mode]
+        if mode in by_key[key]:
+            mean, ok, tot = by_key[key][mode]
             if isinstance(mean, float):
                 row += f' {mean:>8.1f}s {ok}/{tot}'
             else:
