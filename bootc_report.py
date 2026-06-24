@@ -77,6 +77,19 @@ def build_summary_table(data: dict) -> str:
     for bench in data["benchmarks"]:
         target = bench["target_image"]
         mode = get_mode(bench)
+        upgrade_type = bench.get("upgrade_type", "y-stream")
+        variant = bench.get("variant", "vanilla")
+
+        upgrade_badge = (
+            '<span class="badge badge-zstream">z-stream</span>'
+            if upgrade_type == "z-stream"
+            else '<span class="badge badge-ystream">y-stream</span>'
+        )
+        variant_badge = (
+            '<span class="badge badge-customized">customized</span>'
+            if variant == "customized"
+            else '<span class="badge badge-vanilla">vanilla</span>'
+        )
         summary = bench.get("summary", {})
         layer_info = bench.get("target_layer_info", {})
         delta_arts = bench.get("delta_artifacts") or {}
@@ -119,6 +132,8 @@ def build_summary_table(data: dict) -> str:
         rows.append(f"""
         <tr>
             <td>{html.escape(short_image_ref(target))}</td>
+            <td>{upgrade_badge}</td>
+            <td>{variant_badge}</td>
             <td>{mode_badge}</td>
             {delta_cols}
             <td>{format_duration(stage.get('mean'))}<br>
@@ -143,6 +158,8 @@ def build_summary_table(data: dict) -> str:
         <thead>
             <tr>
                 <th>Target</th>
+                <th>Upgrade</th>
+                <th>Variant</th>
                 <th>Mode</th>
                 {delta_headers}
                 <th>Stage (mean)</th>
@@ -280,8 +297,17 @@ def build_chart_data(data: dict) -> dict:
     for bench in data["benchmarks"]:
         mode = get_mode(bench)
         label = short_image_ref(bench["target_image"])
+        upgrade_type = bench.get("upgrade_type", "y-stream")
+        variant = bench.get("variant", "vanilla")
+        label_suffix_parts = []
+        if upgrade_type == "z-stream":
+            label_suffix_parts.append("z")
+        if variant == "customized":
+            label_suffix_parts.append("custom")
         if mode == "delta":
-            label += " (delta)"
+            label_suffix_parts.append("delta")
+        if label_suffix_parts:
+            label += " (" + ", ".join(label_suffix_parts) + ")"
         summary = bench.get("summary", {})
         stage = summary.get("stage_duration_sec", {})
         reboot = summary.get("reboot_duration_sec", {})
@@ -375,7 +401,18 @@ def generate_html(data: dict) -> str:
     for bench in data["benchmarks"]:
         bench_mode = get_mode(bench)
         label = short_image_ref(bench["target_image"])
-        chart_label = label + (" (delta)" if bench_mode == "delta" else "")
+        chart_upgrade_type = bench.get("upgrade_type", "y-stream")
+        chart_variant = bench.get("variant", "vanilla")
+        label_suffix_parts = []
+        if chart_upgrade_type == "z-stream":
+            label_suffix_parts.append("z")
+        if chart_variant == "customized":
+            label_suffix_parts.append("custom")
+        if bench_mode == "delta":
+            label_suffix_parts.append("delta")
+        chart_label = label
+        if label_suffix_parts:
+            chart_label += " (" + ", ".join(label_suffix_parts) + ")"
         safe_id = re.sub(r'[^a-zA-Z0-9_-]', '-', chart_label)
         iter_table = build_iteration_table(bench)
 
@@ -404,9 +441,22 @@ def generate_html(data: dict) -> str:
             else '<span class="badge badge-baseline">baseline</span>'
         )
 
+        bench_upgrade_type = bench.get("upgrade_type", "y-stream")
+        bench_variant = bench.get("variant", "vanilla")
+        upgrade_badge = (
+            '<span class="badge badge-zstream">z-stream</span>'
+            if bench_upgrade_type == "z-stream"
+            else '<span class="badge badge-ystream">y-stream</span>'
+        )
+        variant_badge = (
+            '<span class="badge badge-customized">customized</span>'
+            if bench_variant == "customized"
+            else '<span class="badge badge-vanilla">vanilla</span>'
+        )
+
         target_sections.append(f"""
         <div class="target-section" id="target-{safe_id}">
-            <h3>→ {html.escape(label)} {mode_badge}</h3>
+            <h3>→ {html.escape(label)} {mode_badge} {upgrade_badge} {variant_badge}</h3>
             {artifacts_html}
             {error_html}
             {iter_table}
@@ -434,6 +484,17 @@ def generate_html(data: dict) -> str:
         "baseline": "Registry Pull (baseline)",
         "delta": "OCI Delta",
     }.get(mode, mode)
+
+    extra_config_lines = ""
+    base_stream = config.get('base_stream')
+    if base_stream:
+        extra_config_lines += f"<br><strong>Base stream:</strong> <code>{html.escape(base_stream)}</code>"
+        zt = config.get('zstream_target')
+        if zt:
+            extra_config_lines += f"<br><strong>Z-stream target:</strong> <code>{html.escape(zt)}</code>"
+    pkgs = config.get('packages')
+    if pkgs:
+        extra_config_lines += f"<br><strong>Packages:</strong> <code>{html.escape(', '.join(pkgs))}</code>"
 
     return textwrap.dedent(f"""\
     <!DOCTYPE html>
@@ -500,6 +561,26 @@ def generate_html(data: dict) -> str:
                 background: rgba(57, 210, 192, 0.15);
                 color: var(--cyan);
                 border: 1px solid rgba(57, 210, 192, 0.3);
+            }}
+            .badge-zstream {{
+                background: rgba(210, 153, 34, 0.15);
+                color: var(--orange);
+                border: 1px solid rgba(210, 153, 34, 0.3);
+            }}
+            .badge-ystream {{
+                background: rgba(188, 140, 255, 0.15);
+                color: var(--purple);
+                border: 1px solid rgba(188, 140, 255, 0.3);
+            }}
+            .badge-vanilla {{
+                background: rgba(139, 148, 158, 0.15);
+                color: var(--text-muted);
+                border: 1px solid rgba(139, 148, 158, 0.3);
+            }}
+            .badge-customized {{
+                background: rgba(63, 185, 80, 0.15);
+                color: var(--green);
+                border: 1px solid rgba(63, 185, 80, 0.3);
             }}
             table {{
                 width: 100%;
@@ -621,7 +702,7 @@ def generate_html(data: dict) -> str:
         <p class="subtitle">Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
         <div class="config-box">
-            <strong>Base image:</strong> <code>{html.escape(config.get('base_image', 'N/A'))}</code><br>
+            <strong>Base image:</strong> <code>{html.escape(config.get('base_image', 'N/A'))}</code>{extra_config_lines}<br>
             <strong>Mode:</strong> <span class="badge badge-{'delta' if mode == 'delta' else 'baseline'}">{mode}</span><br>
             <strong>Iterations:</strong> {config.get('iterations', 'N/A')} per target<br>
             <strong>VM:</strong> {config.get('vm_vcpus', '?')} vCPUs, {config.get('vm_memory_mb', '?')} MB RAM<br>
