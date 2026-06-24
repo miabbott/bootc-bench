@@ -2011,20 +2011,103 @@ def run_benchmark(args) -> dict:
         work_dir = Path("/var/tmp/bootc-bench")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    targets = args.targets or DEFAULT_TARGETS
     base_image = args.base_image
+    packages = args.packages if args.packages is not None else DEFAULT_PACKAGES
+    customize = not args.no_customize
+
+    # Z-stream discovery
+    zstream_target = None
+    if args.base_stream:
+        log.info("Discovering z-stream range for %s...", args.base_stream)
+        oldest_ref, newest_ref = discover_zstream_tags(args.image_repo, args.base_stream)
+        base_image = oldest_ref
+        zstream_target = newest_ref
+        log.info("Base (oldest z-stream): %s", base_image)
+        log.info("Z-stream target (newest): %s", zstream_target)
+
+    # Y-stream targets from CLI (explicit --targets)
+    ystream_targets = args.targets or []
+    # If no explicit targets AND no base-stream, use defaults
+    if not ystream_targets and not args.base_stream:
+        ystream_targets = DEFAULT_TARGETS
 
     # Generate SSH keys (cached)
     ssh_priv, ssh_pub = generate_ssh_keypair(cache_dir / "ssh")
 
-    # Build base qcow2 (cached, or use explicit --qcow2 override)
+    # Build vanilla base qcow2
     if args.qcow2:
-        base_qcow2 = Path(args.qcow2).resolve()
-        if not base_qcow2.exists():
-            raise FileNotFoundError(f"Provided qcow2 not found: {base_qcow2}")
-        log.info("Using provided qcow2: %s", base_qcow2)
+        vanilla_qcow2 = Path(args.qcow2).resolve()
+        if not vanilla_qcow2.exists():
+            raise FileNotFoundError(f"Provided qcow2 not found: {vanilla_qcow2}")
+        log.info("Using provided qcow2: %s", vanilla_qcow2)
     else:
-        base_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub)
+        vanilla_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub)
+
+    # Build customized base qcow2
+    custom_qcow2 = None
+    if customize:
+        log.info("Building customized base with packages: %s", ", ".join(packages))
+        custom_qcow2 = build_customized_qcow2(base_image, packages, cache_dir, ssh_pub)
+
+    # Construct scenario list
+    # Each scenario = dict with upgrade_type, variant, base_image, target_image,
+    # qcow2 to use, and optionally custom_target_image and packages.
+    scenarios = []
+
+    # Z-stream scenarios
+    if zstream_target:
+        scenarios.append({
+            "upgrade_type": "z-stream",
+            "variant": "vanilla",
+            "base_image": base_image,
+            "target_image": zstream_target,
+            "qcow2": vanilla_qcow2,
+        })
+        if customize:
+            # Build customized target for z-stream
+            custom_zstream_target = build_customized_target(
+                zstream_target, packages, cache_dir
+            )
+            scenarios.append({
+                "upgrade_type": "z-stream",
+                "variant": "customized",
+                "base_image": base_image,
+                "target_image": zstream_target,
+                "custom_target_image": custom_zstream_target,
+                "qcow2": custom_qcow2,
+                "packages": packages,
+            })
+
+    # Y-stream scenarios
+    for target in ystream_targets:
+        scenarios.append({
+            "upgrade_type": "y-stream",
+            "variant": "vanilla",
+            "base_image": base_image,
+            "target_image": target,
+            "qcow2": vanilla_qcow2,
+        })
+        if customize:
+            custom_ystream_target = build_customized_target(
+                target, packages, cache_dir
+            )
+            scenarios.append({
+                "upgrade_type": "y-stream",
+                "variant": "customized",
+                "base_image": base_image,
+                "target_image": target,
+                "custom_target_image": custom_ystream_target,
+                "qcow2": custom_qcow2,
+                "packages": packages,
+            })
+
+    if not scenarios:
+        raise ValueError("No upgrade scenarios to benchmark. Provide --base-stream and/or --targets.")
+
+    log.info("Benchmark scenarios (%d total):", len(scenarios))
+    for i, s in enumerate(scenarios, 1):
+        log.info("  %d. [%s] [%s] %s → %s", i, s["upgrade_type"], s["variant"],
+                 short_ref(s["base_image"]), short_ref(s.get("custom_target_image", s["target_image"])))
 
     # Connect to libvirt
     vm_mgr = VMManager(uri=args.libvirt_uri)
@@ -2038,7 +2121,6 @@ def run_benchmark(args) -> dict:
         if not oci_delta_bin.exists():
             raise FileNotFoundError(f"oci-delta binary not found: {oci_delta_bin}")
 
-    # Start local registry for gzip/zstd modes
     registry_addr = None
     if uses_local_registry:
         registry_addr = start_local_registry()
@@ -2046,7 +2128,12 @@ def run_benchmark(args) -> dict:
     all_results = {
         "config": {
             "base_image": base_image,
-            "targets": targets,
+            "base_stream": getattr(args, 'base_stream', None),
+            "image_repo": getattr(args, 'image_repo', DEFAULT_IMAGE_REPO),
+            "zstream_target": zstream_target,
+            "ystream_targets": ystream_targets,
+            "packages": packages if customize else None,
+            "customize": customize,
             "iterations": args.iterations,
             "vm_memory_mb": args.vm_memory,
             "vm_vcpus": args.vm_vcpus,
@@ -2057,85 +2144,92 @@ def run_benchmark(args) -> dict:
     }
 
     try:
-        for target in targets:
+        for scenario in scenarios:
+            upgrade_type = scenario["upgrade_type"]
+            variant = scenario["variant"]
+            target = scenario["target_image"]
+            base_qcow2 = scenario["qcow2"]
+
+            # For customized variants, the effective target is the custom-built local image
+            # For customized + local registry modes, we need to push the custom target
+            if variant == "customized":
+                effective_target = scenario["custom_target_image"]
+            else:
+                effective_target = target
+
             log.info("=" * 60)
-            log.info("Benchmarking [%s] upgrade: %s -> %s",
-                     mode, base_image, target)
+            log.info("Scenario: [%s] [%s] [%s]", upgrade_type, variant, mode)
+            log.info("  Base: %s", scenario["base_image"])
+            log.info("  Target: %s (effective: %s)", target, effective_target)
             log.info("=" * 60)
 
-            # For local registry modes, push the target image and
-            # translate the ref to point at the local registry.
-            effective_target = target
+            # For local registry modes, push the target to local registry
             if uses_local_registry:
-                # Build a local tag from the original ref
-                # e.g. "registry.redhat.io/rhel9/rhel-bootc:9.8"
-                #   → "rhel-bootc:9.8-gzip" or "rhel-bootc:9.8-zstd-chunked"
-                base_name = target.split("/")[-1]  # "rhel-bootc:9.8"
+                base_name = effective_target.split("/")[-1].replace(":", "-")
                 suffix = "gzip" if mode == "baseline-gzip" else "zstd-chunked"
                 compress_fmt = None if mode == "baseline-gzip" else "zstd:chunked"
                 local_tag = f"{base_name}-{suffix}"
-                push_to_local_registry(target, local_tag, compress_fmt)
+
+                if variant == "customized":
+                    # Push from local podman storage (the custom target is local)
+                    # Need to use containers-storage: transport instead of docker://
+                    _push_local_image_to_registry(effective_target, local_tag, compress_fmt)
+                else:
+                    push_to_local_registry(effective_target, local_tag, compress_fmt)
+
                 effective_target = f"{registry_addr}/{local_tag}"
                 log.info("Using local registry target: %s", effective_target)
 
-            # Collect layer info once per target from the host
-            log.info("Collecting target image layer info from host...")
-            target_layer_info = get_image_layer_info_host(target)
+            # Collect layer info
+            log.info("Collecting target image layer info...")
+            if variant == "customized":
+                # For custom images in local storage, inspect differently
+                target_layer_info = _get_local_image_layer_info(scenario["custom_target_image"])
+            else:
+                target_layer_info = get_image_layer_info_host(target)
             if "error" in target_layer_info:
-                log.warning("Could not collect layer info: %s",
-                            target_layer_info["error"])
+                log.warning("Could not collect layer info: %s", target_layer_info["error"])
 
             # Prepare delta artifacts if in delta mode
             delta_artifacts = None
             if mode == "delta":
                 log.info("Preparing delta artifacts...")
-                # The delta must be created from the *derived* image (the
-                # one actually deployed on the VM, with SSH keys baked in)
-                # so that oci-delta apply can match the config digest in
-                # /ostree/repo.
-                #
-                # Check in order:
-                #  1. derived.oci-archive already on disk → use it (no sudo)
-                #  2. Derived image in root podman storage → export it
-                #  3. Fall back to raw base image (may cause digest mismatch)
-                derived_image = None
-                derived_archive = cache_dir / "archives" / "derived.oci-archive"
-                if derived_archive.exists():
-                    # Archive already exported — tell prepare_delta_artifacts
-                    # to use the "derived" label so it picks up this file.
-                    derived_image = DERIVED_IMAGE_TAG
-                    log.info("Using existing derived archive: %s",
-                             derived_archive)
+                if variant == "customized":
+                    derived_image = "localhost/bootc-bench-custom-base:latest"
                 else:
-                    # Need to export — check if the image is in podman storage
-                    rc = subprocess.run(
-                        ["sudo", "podman", "image", "exists",
-                         DERIVED_IMAGE_TAG],
-                    ).returncode
-                    if rc == 0:
-                        derived_image = DERIVED_IMAGE_TAG
-                        log.info("Will export derived image: %s",
-                                 derived_image)
-                    else:
-                        log.warning(
-                            "Derived image %s not found in podman "
-                            "storage and no cached archive at %s; "
-                            "falling back to raw base image %s. "
-                            "This may fail if the VM was built from a "
-                            "derived image with a different config digest.",
-                            DERIVED_IMAGE_TAG, derived_archive, base_image,
-                        )
+                    derived_image = DERIVED_IMAGE_TAG
+
+                # Check if the derived image exists in podman storage
+                rc = subprocess.run(
+                    ["sudo", "podman", "image", "exists", derived_image],
+                    capture_output=True,
+                ).returncode
+                if rc != 0:
+                    log.warning(
+                        "Derived image %s not found; falling back to base image",
+                        derived_image,
+                    )
+                    derived_image = None
+
+                # Determine the target ref for delta creation
+                delta_target = scenario.get("custom_target_image", target) if variant == "customized" else target
+
                 delta_artifacts = prepare_delta_artifacts(
-                    base_image, target, oci_delta_bin, cache_dir,
+                    base_image,
+                    delta_target,
+                    oci_delta_bin, cache_dir,
                     derived_image=derived_image,
                 )
 
             benchmark = {
-                "base_image": base_image,
+                "base_image": scenario["base_image"],
                 "target_image": target,
                 "effective_target": effective_target,
                 "target_layer_info": target_layer_info,
                 "mode": mode,
+                "upgrade_type": upgrade_type,
+                "variant": variant,
+                "packages": scenario.get("packages"),
                 "delta_artifacts": delta_artifacts,
                 "iterations": [],
                 "summary": {},
@@ -2144,14 +2238,15 @@ def run_benchmark(args) -> dict:
             iteration_results = []
             for i in range(1, args.iterations + 1):
                 log.info("-" * 40)
-                log.info("Iteration %d/%d [%s]", i, args.iterations, mode)
+                log.info("Iteration %d/%d [%s] [%s] [%s]",
+                         i, args.iterations, upgrade_type, variant, mode)
                 log.info("-" * 40)
 
                 if mode == "delta":
                     result = run_iteration_delta(
                         iteration_num=i,
                         base_qcow2=base_qcow2,
-                        target_image=target,
+                        target_image=effective_target,
                         ssh_key_path=ssh_priv,
                         vm_mgr=vm_mgr,
                         work_dir=work_dir,
@@ -2174,6 +2269,11 @@ def run_benchmark(args) -> dict:
                         vm_vcpus=args.vm_vcpus,
                         mode=mode,
                     )
+
+                # Tag the result with scenario metadata
+                result.variant = variant
+                result.upgrade_type = upgrade_type
+
                 iteration_results.append(result)
                 benchmark["iterations"].append(asdict(result))
 
@@ -2203,19 +2303,39 @@ def main():
               # Run with defaults (3 iterations, all targets)
               %(prog)s
 
-              # Single target, 5 iterations
-              %(prog)s -t registry.redhat.io/rhel9/rhel-bootc:9.8 -n 5
+              # Realistic z-stream + y-stream benchmark
+              %(prog)s --base-stream 9.6 -t registry.redhat.io/rhel9/rhel-bootc:9.8
 
               # Use a pre-built qcow2
               %(prog)s --qcow2 /path/to/base.qcow2
 
-              # Custom output directory
-              %(prog)s -o /tmp/bench-results
+              # Custom packages and output directory
+              %(prog)s --base-stream 9.6 --packages httpd nginx -o /tmp/bench-results
         """),
     )
     parser.add_argument(
         "-b", "--base-image", default=DEFAULT_BASE_IMAGE,
         help=f"Base bootc image (default: {DEFAULT_BASE_IMAGE})",
+    )
+    parser.add_argument(
+        "--base-stream", default=None,
+        help="Y-stream version to auto-discover z-stream range (e.g. '9.6'). "
+             "When set, overrides --base-image with the oldest build tag for "
+             "this stream and adds the newest as a z-stream upgrade target.",
+    )
+    parser.add_argument(
+        "--image-repo", default=DEFAULT_IMAGE_REPO,
+        help=f"Image repository for tag discovery (default: {DEFAULT_IMAGE_REPO})",
+    )
+    parser.add_argument(
+        "--packages", nargs="+", default=None,
+        help="RPM packages to install for customized variants "
+             f"(default: {' '.join(DEFAULT_PACKAGES)}). "
+             "Pass --no-customize to skip customized variants entirely.",
+    )
+    parser.add_argument(
+        "--no-customize", action="store_true",
+        help="Skip customized (package-layered) upgrade variants",
     )
     parser.add_argument(
         "-t", "--targets", nargs="+", default=None,
@@ -2291,10 +2411,12 @@ def main():
         # Print quick summary
         for bench in results.get("benchmarks", []):
             target = bench["target_image"]
+            upgrade_type = bench.get("upgrade_type", "y-stream")
+            variant = bench.get("variant", "vanilla")
             summary = bench.get("summary", {})
             total = summary.get("total_duration_sec", {})
             print(f"\n{'=' * 50}")
-            print(f"Target: {target}")
+            print(f"Target: {target} [{upgrade_type}] [{variant}]")
             if isinstance(total, dict):
                 print(f"  Total: {total.get('mean', 'N/A')}s "
                       f"(±{total.get('stddev', 'N/A')}s)")
