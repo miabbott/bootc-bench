@@ -302,7 +302,7 @@ class VMManager:
           </cputune>
           <devices>
             <disk type='file' device='disk'>
-              <driver name='qemu' type='qcow2'/>
+              <driver name='qemu' type='qcow2' discard='ignore'/>
               <source file='{disk_path}'/>
               <target dev='vda' bus='virtio'/>
             </disk>
