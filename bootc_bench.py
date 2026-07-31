@@ -772,7 +772,10 @@ def build_base_qcow2(
     containerfile = build_dir / "Containerfile"
     containerfile.write_text(textwrap.dedent(f"""\
         FROM {base_image}
-        RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        # On Fedora bootc images /root is a symlink to var/roothome, which
+        # doesn't exist yet in the pristine (undeployed) image -- create it
+        # first so `mkdir -p /root/.ssh` has something to resolve through.
+        RUN mkdir -p /var/roothome /root/.ssh && chmod 700 /root/.ssh
         COPY authorized_keys /root/.ssh/authorized_keys
         RUN chmod 600 /root/.ssh/authorized_keys
         # Ensure sshd is enabled
@@ -860,7 +863,10 @@ def build_customized_image(
         if inject_bench_config and ssh_pub_key_path:
             shutil.copy2(ssh_pub_key_path, build_dir / "authorized_keys")
             lines.extend([
-                "RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+                # See comment in build_base_qcow2: /root is a dangling
+                # symlink to var/roothome on Fedora bootc images until
+                # that target directory is created.
+                "RUN mkdir -p /var/roothome /root/.ssh && chmod 700 /root/.ssh",
                 "COPY authorized_keys /root/.ssh/authorized_keys",
                 "RUN chmod 600 /root/.ssh/authorized_keys",
                 "RUN systemctl enable sshd",
