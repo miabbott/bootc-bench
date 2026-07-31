@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree
 
 import libvirt
 import paramiko
@@ -50,6 +51,9 @@ DEFAULT_VM_DISK_GB = 40
 # ionice -c3 = idle I/O class (only uses I/O when nothing else needs it).
 NICE_PREFIX = ["nice", "-n", "10", "ionice", "-c3"]
 BIB_IMAGE = "registry.redhat.io/rhel9/bootc-image-builder"
+# Upstream bootc-image-builder, used automatically for non-RHEL base images
+# (e.g. Fedora) that don't have registry.redhat.io entitlements.
+FEDORA_BIB_IMAGE = "quay.io/centos-bootc/bootc-image-builder:latest"
 OCI_DELTA_BIN_DEFAULT = "./oci-delta"
 REGISTRY_CONTAINER_NAME = "bootc-bench-registry"
 REGISTRY_IMAGE = "docker.io/library/registry:2"
@@ -66,6 +70,16 @@ DEFAULT_PACKAGES = [
 ]
 
 DEFAULT_IMAGE_REPO = "registry.redhat.io/rhel9/rhel-bootc"
+
+# Simulated network conditions, applied via tc netem on the VM's host-side
+# tap device for the duration of the upgrade phase. Chosen to bracket a
+# realistic range: a healthy broadband link vs. a constrained/edge link
+# where oci-delta's smaller transfer size should matter more.
+NETWORK_PROFILES = {
+    "none": None,
+    "broadband": {"rate": "100mbit", "delay": "10ms"},
+    "constrained": {"rate": "5mbit", "delay": "150ms", "loss": "1%"},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +125,7 @@ def discover_zstream_tags(image_repo: str, y_stream: str) -> tuple[str, str]:
 
 @dataclass
 class MonitorSample:
-    """A single CPU/memory sample from virsh domstats."""
+    """A single CPU/memory/network/disk sample from virsh domstats."""
     timestamp: float
     cpu_time_ns: int = 0
     cpu_user_ns: int = 0
@@ -119,6 +133,13 @@ class MonitorSample:
     memory_rss_kb: int = 0
     memory_available_kb: int = 0
     memory_used_kb: int = 0
+    # Cumulative counters (as reported by libvirt) for the VM's primary
+    # network interface and primary block device. These are running totals
+    # since VM start, not deltas -- callers diff last-vs-first sample.
+    net_rx_bytes: int = 0
+    net_tx_bytes: int = 0
+    disk_rd_bytes: int = 0
+    disk_wr_bytes: int = 0
 
 
 @dataclass
@@ -153,8 +174,17 @@ class IterationResult:
     mode: str = "baseline"
     variant: str = "vanilla"        # "vanilla" or "customized"
     upgrade_type: str = "y-stream"  # "z-stream" or "y-stream"
+    network_profile: str = "none"   # "none", "broadband", "constrained"
     cpu_samples: list = field(default_factory=list)
     memory_samples: list = field(default_factory=list)
+    network_samples: list = field(default_factory=list)
+    disk_io_samples: list = field(default_factory=list)
+    # Net/disk I/O observed during the monitored window (last sample minus
+    # first sample of the corresponding cumulative libvirt counter).
+    net_rx_bytes_delta: Optional[int] = None
+    net_tx_bytes_delta: Optional[int] = None
+    disk_rd_bytes_delta: Optional[int] = None
+    disk_wr_bytes_delta: Optional[int] = None
     error: Optional[str] = None
 
 
@@ -356,7 +386,31 @@ class VMManager:
             time.sleep(3)
         raise TimeoutError(f"VM did not get an IP within {timeout}s")
 
-    def get_domstats(self, dom: libvirt.virDomain) -> MonitorSample:
+    def get_primary_iface_dev(self, dom: libvirt.virDomain) -> Optional[str]:
+        """Look up the host-side tap/vnet device name for the VM's first
+        network interface, by parsing the live domain XML.
+
+        Libvirt auto-assigns this (e.g. 'vnet0') when the VM starts since
+        our domain XML doesn't pin a <target dev=.../>. Needed both for
+        interfaceStats() sampling and for applying tc netem shaping.
+        """
+        try:
+            xml_desc = dom.XMLDesc(0)
+            root = ElementTree.fromstring(xml_desc)
+            iface = root.find("./devices/interface")
+            if iface is None:
+                return None
+            target = iface.find("target")
+            if target is None:
+                return None
+            return target.get("dev")
+        except (libvirt.libvirtError, ElementTree.ParseError) as e:
+            log.debug("Failed to determine primary interface device: %s", e)
+            return None
+
+    def get_domstats(self, dom: libvirt.virDomain,
+                      iface_dev: Optional[str] = None,
+                      disk_dev: str = "vda") -> MonitorSample:
         """Collect a single stats sample via virsh domstats."""
         sample = MonitorSample(timestamp=time.time())
         try:
@@ -374,6 +428,24 @@ class VMManager:
             sample.cpu_time_ns = info[4] if len(info) > 4 else 0
         except libvirt.libvirtError as e:
             log.debug("Failed to collect CPU stats: %s", e)
+
+        if iface_dev:
+            try:
+                # (rx_bytes, rx_packets, rx_errs, rx_drop,
+                #  tx_bytes, tx_packets, tx_errs, tx_drop)
+                net_stats = dom.interfaceStats(iface_dev)
+                sample.net_rx_bytes = net_stats[0]
+                sample.net_tx_bytes = net_stats[4]
+            except libvirt.libvirtError as e:
+                log.debug("Failed to collect interface stats: %s", e)
+
+        try:
+            # (rd_req, rd_bytes, wr_req, wr_bytes, errs)
+            block_stats = dom.blockStats(disk_dev)
+            sample.disk_rd_bytes = block_stats[1]
+            sample.disk_wr_bytes = block_stats[3]
+        except libvirt.libvirtError as e:
+            log.debug("Failed to collect block stats: %s", e)
 
         return sample
 
@@ -408,13 +480,17 @@ class VMManager:
 # ---------------------------------------------------------------------------
 
 class ResourceMonitor:
-    """Collect CPU/memory samples in a background thread."""
+    """Collect CPU/memory/network/disk samples in a background thread."""
 
     def __init__(self, vm_mgr: VMManager, dom: libvirt.virDomain,
-                 interval: float = MONITOR_INTERVAL_SEC):
+                 interval: float = MONITOR_INTERVAL_SEC,
+                 iface_dev: Optional[str] = None,
+                 disk_dev: str = "vda"):
         self.vm_mgr = vm_mgr
         self.dom = dom
         self.interval = interval
+        self.iface_dev = iface_dev
+        self.disk_dev = disk_dev
         self.samples: list[MonitorSample] = []
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -423,7 +499,8 @@ class ResourceMonitor:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        log.info("Resource monitor started")
+        log.info("Resource monitor started (iface=%s disk=%s)",
+                 self.iface_dev, self.disk_dev)
 
     def stop(self) -> list[MonitorSample]:
         self._stop.set()
@@ -435,11 +512,55 @@ class ResourceMonitor:
     def _run(self):
         while not self._stop.is_set():
             try:
-                sample = self.vm_mgr.get_domstats(self.dom)
+                sample = self.vm_mgr.get_domstats(
+                    self.dom, iface_dev=self.iface_dev,
+                    disk_dev=self.disk_dev)
                 self.samples.append(sample)
             except Exception as e:
                 log.debug("Monitor sample error: %s", e)
             self._stop.wait(self.interval)
+
+
+# ---------------------------------------------------------------------------
+# Network shaping (tc netem on the VM's host-side tap device)
+# ---------------------------------------------------------------------------
+
+def apply_network_shaping(iface_dev: str, profile: str):
+    """Apply a tc netem profile to the VM's host-side tap device.
+
+    No-op for profile 'none' or an unknown iface_dev. Requires root
+    (CAP_NET_ADMIN); invoked via sudo like the rest of the harness's
+    privileged operations.
+    """
+    params = NETWORK_PROFILES.get(profile)
+    if not params or not iface_dev:
+        return
+    cmd = ["sudo", "tc", "qdisc", "add", "dev", iface_dev, "root", "netem"]
+    for key, value in params.items():
+        cmd.extend([key, value])
+    log.info("Applying network profile '%s' to %s: %s",
+             profile, iface_dev, " ".join(f"{k} {v}" for k, v in params.items()))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.warning("Failed to apply network shaping on %s: %s",
+                    iface_dev, result.stderr.strip())
+
+
+def clear_network_shaping(iface_dev: Optional[str]):
+    """Remove any tc netem qdisc from the VM's host-side tap device.
+
+    Safe to call even if no shaping was applied (e.g. profile 'none') --
+    errors from tc when there's nothing to delete are logged at debug
+    level only.
+    """
+    if not iface_dev:
+        return
+    result = subprocess.run(
+        ["sudo", "tc", "qdisc", "del", "dev", iface_dev, "root"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log.debug("tc qdisc del on %s: %s", iface_dev, result.stderr.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +743,7 @@ def build_base_qcow2(
     base_image: str,
     output_dir: Path,
     ssh_pub_key_path: Path,
+    bib_image: str = BIB_IMAGE,
 ) -> Path:
     """Build a qcow2 disk image from the base bootc container image.
 
@@ -689,7 +811,7 @@ def build_base_qcow2(
     bib_cmd = [x for x in bib_cmd if x is not None]
     if authfile:
         bib_cmd.extend(["-v", f"{authfile}:/run/containers/0/auth.json:ro"])
-    bib_cmd.extend([BIB_IMAGE, "--type", "qcow2", "--local", derived_tag])
+    bib_cmd.extend([bib_image, "--type", "qcow2", "--local", derived_tag])
     subprocess.run(bib_cmd, check=True)
 
     # bootc-image-builder outputs to /output/qcow2/disk.qcow2
@@ -768,6 +890,7 @@ def build_customized_qcow2(
     packages: list[str],
     output_dir: Path,
     ssh_pub_key_path: Path,
+    bib_image: str = BIB_IMAGE,
 ) -> Path:
     """Build a qcow2 from a customized (packages-layered) base image.
 
@@ -805,7 +928,7 @@ def build_customized_qcow2(
     bib_cmd = [x for x in bib_cmd if x is not None]
     if authfile:
         bib_cmd.extend(["-v", f"{authfile}:/run/containers/0/auth.json:ro"])
-    bib_cmd.extend([BIB_IMAGE, "--type", "qcow2", "--local", derived_tag])
+    bib_cmd.extend([bib_image, "--type", "qcow2", "--local", derived_tag])
     subprocess.run(bib_cmd, check=True)
 
     built_qcow2 = bib_output / "qcow2" / "disk.qcow2"
@@ -1157,6 +1280,7 @@ def _run_iteration_lifecycle(
     log_prefix: str,
     upgrade_fn,
     completion_log_fn,
+    network_profile: str = "none",
 ) -> IterationResult:
     """Shared VM lifecycle for a single benchmark iteration.
 
@@ -1173,10 +1297,15 @@ def _run_iteration_lifecycle(
             the lifecycle handles the early return.
         completion_log_fn: ``(stage_dur, reboot_dur, total_dur) -> None`` —
             emit the mode-specific "Complete" log line.
+        network_profile: key into NETWORK_PROFILES; shapes the VM's
+            host-side tap device for the duration of the monitored window
+            (applied once the VM is up, cleared unconditionally on exit).
     """
     disk_path = work_dir / f"{vm_name}.qcow2"
     dom = None
     ssh = None
+    iface_dev = None
+    result.network_profile = network_profile
 
     try:
         # 1. Copy base qcow2
@@ -1204,16 +1333,27 @@ def _run_iteration_lifecycle(
         ssh = SSH(vm_ip, str(ssh_key_path))
         ssh.connect()
 
+        # 3b. Resolve the host-side tap device and apply network shaping
+        # (if requested) before any upgrade traffic flows.
+        iface_dev = vm_mgr.get_primary_iface_dev(dom)
+        if network_profile != "none":
+            if iface_dev:
+                apply_network_shaping(iface_dev, network_profile)
+            else:
+                log.warning("[%s %d] Could not resolve tap device; "
+                            "network profile '%s' not applied",
+                            log_prefix, iteration_num, network_profile)
+
         # 4. Pre-upgrade baseline
         log.info("[%s %d] Collecting pre-upgrade baseline...", log_prefix,
-                 iteration_num)
+                  iteration_num)
         result.pre_upgrade = {
             "bootc_status": collect_bootc_status(ssh),
             "disk_usage": collect_disk_usage(ssh),
         }
 
         # 5. Start resource monitor
-        monitor = ResourceMonitor(vm_mgr, dom)
+        monitor = ResourceMonitor(vm_mgr, dom, iface_dev=iface_dev)
         monitor.start()
 
         # 6. Mode-specific upgrade work
@@ -1286,6 +1426,32 @@ def _run_iteration_lifecycle(
             }
             for s in samples
         ]
+        result.network_samples = [
+            {
+                "timestamp": s.timestamp,
+                "rx_bytes": s.net_rx_bytes,
+                "tx_bytes": s.net_tx_bytes,
+            }
+            for s in samples
+        ]
+        result.disk_io_samples = [
+            {
+                "timestamp": s.timestamp,
+                "rd_bytes": s.disk_rd_bytes,
+                "wr_bytes": s.disk_wr_bytes,
+            }
+            for s in samples
+        ]
+
+        # libvirt interface/block stats are cumulative counters since VM
+        # start, so the I/O attributable to this iteration's monitored
+        # window is simply the last sample minus the first.
+        if len(samples) >= 2:
+            first, last = samples[0], samples[-1]
+            result.net_rx_bytes_delta = last.net_rx_bytes - first.net_rx_bytes
+            result.net_tx_bytes_delta = last.net_tx_bytes - first.net_tx_bytes
+            result.disk_rd_bytes_delta = last.disk_rd_bytes - first.disk_rd_bytes
+            result.disk_wr_bytes_delta = last.disk_wr_bytes - first.disk_wr_bytes
 
         completion_log_fn(stage_duration, reboot_duration,
                           result.total_duration_sec)
@@ -1297,6 +1463,7 @@ def _run_iteration_lifecycle(
 
     finally:
         # Cleanup
+        clear_network_shaping(iface_dev)
         if ssh:
             ssh.close()
         if dom:
@@ -1323,6 +1490,7 @@ def run_iteration(
     vm_memory_mb: int = DEFAULT_VM_MEMORY_MB,
     vm_vcpus: int = DEFAULT_VM_VCPUS,
     mode: str = "baseline",
+    network_profile: str = "none",
 ) -> IterationResult:
     """Run a single benchmark iteration."""
     result = IterationResult(iteration=iteration_num, mode=mode)
@@ -1401,6 +1569,7 @@ def run_iteration(
         log_prefix="Iter",
         upgrade_fn=upgrade_fn,
         completion_log_fn=completion_log_fn,
+        network_profile=network_profile,
     )
 
 
@@ -1756,6 +1925,7 @@ def run_iteration_delta(
     target_layer_info: Optional[dict] = None,
     vm_memory_mb: int = DEFAULT_VM_MEMORY_MB,
     vm_vcpus: int = DEFAULT_VM_VCPUS,
+    network_profile: str = "none",
 ) -> IterationResult:
     """Run a single benchmark iteration using oci-delta."""
     result = IterationResult(iteration=iteration_num, mode="delta")
@@ -1910,6 +2080,7 @@ def run_iteration_delta(
         log_prefix="Delta Iter",
         upgrade_fn=upgrade_fn,
         completion_log_fn=completion_log_fn,
+        network_profile=network_profile,
     )
 
 
@@ -1960,6 +2131,29 @@ def compute_summary(results: list[IterationResult]) -> dict:
                    if r.disk_delta_bytes is not None]
     if disk_deltas:
         summary["disk_delta_bytes"] = stat(disk_deltas)
+
+    # Network/disk I/O observed via libvirt during the monitored window
+    # (see MonitorSample / ResourceMonitor). Distinct from disk_delta_bytes
+    # above, which is a before/after `df` snapshot on the guest filesystem.
+    net_rx = [r.net_rx_bytes_delta for r in successful
+              if r.net_rx_bytes_delta is not None]
+    if net_rx:
+        summary["net_rx_bytes"] = stat(net_rx)
+
+    net_tx = [r.net_tx_bytes_delta for r in successful
+              if r.net_tx_bytes_delta is not None]
+    if net_tx:
+        summary["net_tx_bytes"] = stat(net_tx)
+
+    disk_rd = [r.disk_rd_bytes_delta for r in successful
+               if r.disk_rd_bytes_delta is not None]
+    if disk_rd:
+        summary["disk_rd_bytes"] = stat(disk_rd)
+
+    disk_wr = [r.disk_wr_bytes_delta for r in successful
+               if r.disk_wr_bytes_delta is not None]
+    if disk_wr:
+        summary["disk_wr_bytes"] = stat(disk_wr)
 
     # Delta-mode phases
     transfer_times = [r.delta_transfer_phase.duration_sec for r in successful
@@ -2014,6 +2208,16 @@ def run_benchmark(args) -> dict:
     base_image = args.base_image
     packages = args.packages if args.packages is not None else DEFAULT_PACKAGES
     customize = not args.no_customize
+    network_profile = getattr(args, "network_profile", "none")
+
+    # Pick a working bootc-image-builder image. registry.redhat.io's BIB
+    # requires RHEL entitlements; auto-switch to the upstream image for
+    # non-RHEL (e.g. Fedora) base images unless explicitly overridden.
+    bib_image = args.bib_image
+    if not bib_image:
+        bib_image = (FEDORA_BIB_IMAGE if "fedora" in base_image.lower()
+                     else BIB_IMAGE)
+    log.info("Using bootc-image-builder image: %s", bib_image)
 
     # Z-stream discovery
     zstream_target = None
@@ -2041,13 +2245,15 @@ def run_benchmark(args) -> dict:
             raise FileNotFoundError(f"Provided qcow2 not found: {vanilla_qcow2}")
         log.info("Using provided qcow2: %s", vanilla_qcow2)
     else:
-        vanilla_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub)
+        vanilla_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub,
+                                          bib_image=bib_image)
 
     # Build customized base qcow2
     custom_qcow2 = None
     if customize:
         log.info("Building customized base with packages: %s", ", ".join(packages))
-        custom_qcow2 = build_customized_qcow2(base_image, packages, cache_dir, ssh_pub)
+        custom_qcow2 = build_customized_qcow2(base_image, packages, cache_dir, ssh_pub,
+                                               bib_image=bib_image)
 
     # Construct scenario list
     # Each scenario = dict with upgrade_type, variant, base_image, target_image,
@@ -2138,6 +2344,7 @@ def run_benchmark(args) -> dict:
             "vm_memory_mb": args.vm_memory,
             "vm_vcpus": args.vm_vcpus,
             "mode": mode,
+            "network_profile": network_profile,
             "timestamp": datetime.now().isoformat(),
         },
         "benchmarks": [],
@@ -2227,6 +2434,7 @@ def run_benchmark(args) -> dict:
                 "effective_target": effective_target,
                 "target_layer_info": target_layer_info,
                 "mode": mode,
+                "network_profile": network_profile,
                 "upgrade_type": upgrade_type,
                 "variant": variant,
                 "packages": scenario.get("packages"),
@@ -2255,6 +2463,7 @@ def run_benchmark(args) -> dict:
                         target_layer_info=target_layer_info,
                         vm_memory_mb=args.vm_memory,
                         vm_vcpus=args.vm_vcpus,
+                        network_profile=network_profile,
                     )
                 else:
                     result = run_iteration(
@@ -2268,6 +2477,7 @@ def run_benchmark(args) -> dict:
                         vm_memory_mb=args.vm_memory,
                         vm_vcpus=args.vm_vcpus,
                         mode=mode,
+                        network_profile=network_profile,
                     )
 
                 # Tag the result with scenario metadata
@@ -2383,6 +2593,22 @@ def main():
     parser.add_argument(
         "--oci-delta-bin", default=OCI_DELTA_BIN_DEFAULT,
         help=f"Path to oci-delta binary (default: {OCI_DELTA_BIN_DEFAULT})",
+    )
+    parser.add_argument(
+        "--network-profile",
+        choices=sorted(NETWORK_PROFILES.keys()),
+        default="none",
+        help="Simulated network condition applied via tc netem on the VM's "
+             "host-side tap device for the duration of the upgrade phase: "
+             "'none' (host network, unshaped), 'broadband' (~100mbit/10ms), "
+             "'constrained' (~5mbit/150ms/1%% loss). Applies to any mode. "
+             "(default: none)",
+    )
+    parser.add_argument(
+        "--bib-image", default=None,
+        help="bootc-image-builder container image to use. Defaults to "
+             f"{FEDORA_BIB_IMAGE!r} when --base-image contains 'fedora', "
+             f"otherwise {BIB_IMAGE!r}.",
     )
     parser.add_argument(
         "--cache-dir", default=None,
