@@ -70,9 +70,24 @@ def has_baseline_benchmarks(data: dict) -> bool:
     return any(get_mode(b) == "baseline" for b in data["benchmarks"])
 
 
+def has_network_profiles(data: dict) -> bool:
+    """Check if any benchmark ran under a simulated (non-'none') network profile."""
+    return any(b.get("network_profile", "none") != "none"
+               for b in data["benchmarks"])
+
+
+def has_io_stats(data: dict) -> bool:
+    """Check if any benchmark has libvirt-sampled network/disk I/O data."""
+    return any(b.get("summary", {}).get("net_rx_bytes") or
+               b.get("summary", {}).get("disk_rd_bytes")
+               for b in data["benchmarks"])
+
+
 def build_summary_table(data: dict) -> str:
     """Build the HTML summary comparison table."""
     show_delta = has_delta_benchmarks(data)
+    show_profile = has_network_profiles(data)
+    show_io = has_io_stats(data)
     rows = []
     for bench in data["benchmarks"]:
         target = bench["target_image"]
@@ -129,12 +144,38 @@ def build_summary_table(data: dict) -> str:
             <td class="na">—</td>
             <td class="na">—</td>"""
 
+        # Network profile column (only shown when the run compares profiles)
+        profile_col = ""
+        if show_profile:
+            profile = bench.get("network_profile", "none")
+            profile_col = f"""
+            <td><span class="badge badge-profile">{html.escape(profile)}</span></td>"""
+
+        # Network/disk I/O columns (libvirt-sampled, during the monitored
+        # window -- distinct from the guest-filesystem before/after delta)
+        io_cols = ""
+        if show_io:
+            net_rx = summary.get("net_rx_bytes", {}).get("mean")
+            net_tx = summary.get("net_tx_bytes", {}).get("mean")
+            disk_rd = summary.get("disk_rd_bytes", {}).get("mean")
+            disk_wr = summary.get("disk_wr_bytes", {}).get("mean")
+            net_total = (None if net_rx is None and net_tx is None
+                         else (net_rx or 0) + (net_tx or 0))
+            disk_total = (None if disk_rd is None and disk_wr is None
+                          else (disk_rd or 0) + (disk_wr or 0))
+            net_title = f"rx {format_bytes(net_rx)} / tx {format_bytes(net_tx)}"
+            disk_title = f"read {format_bytes(disk_rd)} / write {format_bytes(disk_wr)}"
+            io_cols = f"""
+            <td title="{html.escape(net_title)}">{format_bytes(net_total)}</td>
+            <td title="{html.escape(disk_title)}">{format_bytes(disk_total)}</td>"""
+
         rows.append(f"""
         <tr>
             <td>{html.escape(short_image_ref(target))}</td>
             <td>{upgrade_badge}</td>
             <td>{variant_badge}</td>
             <td>{mode_badge}</td>
+            {profile_col}
             {delta_cols}
             <td>{format_duration(stage.get('mean'))}<br>
                 <small>±{stage.get('stddev', 0):.1f}s</small></td>
@@ -144,6 +185,7 @@ def build_summary_table(data: dict) -> str:
                 <small>±{total.get('stddev', 0):.1f}s</small></td>
             <td>{layer_info.get('layer_count', 'N/A')}</td>
             <td>{dl_size}</td>
+            {io_cols}
             <td>{success}/{success + failed}</td>
         </tr>""")
 
@@ -153,6 +195,13 @@ def build_summary_table(data: dict) -> str:
                 <th>Transfer (mean)</th>
                 <th>Apply (mean)</th>"""
 
+    profile_header = '<th>Network</th>' if show_profile else ""
+    io_headers = ""
+    if show_io:
+        io_headers = """
+                <th>Net I/O (mean)</th>
+                <th>Disk I/O (mean)</th>"""
+
     return f"""
     <table>
         <thead>
@@ -161,12 +210,14 @@ def build_summary_table(data: dict) -> str:
                 <th>Upgrade</th>
                 <th>Variant</th>
                 <th>Mode</th>
+                {profile_header}
                 {delta_headers}
                 <th>Stage (mean)</th>
                 <th>Reboot (mean)</th>
                 <th>Total (mean)</th>
                 <th>Layers</th>
                 <th>Download Size</th>
+                {io_headers}
                 <th>Success</th>
             </tr>
         </thead>
@@ -343,9 +394,17 @@ def build_chart_data(data: dict) -> dict:
             iter_data["transfers"].append(tp.get("duration_sec", 0))
             iter_data["applies"].append(ap.get("duration_sec", 0))
 
-        # CPU/memory time series from first successful iteration
+        # CPU/memory/network/disk time series from first successful
+        # iteration. cpu_samples holds the full MonitorSample per tick
+        # (cpu, memory, net, disk are all sampled together by
+        # ResourceMonitor), so a single pass derives all of them.
         cpu_ts = []
         mem_ts = []
+        cpu_pct_ts = []
+        net_rx_ts = []
+        net_tx_ts = []
+        disk_rd_ts = []
+        disk_wr_ts = []
         for it in bench.get("iterations", []):
             if it.get("error") is not None:
                 continue
@@ -362,10 +421,49 @@ def build_chart_data(data: dict) -> dict:
                      "y": s.get("memory_rss_kb", 0) / 1024}
                     for s in samples
                 ]
+                # Cumulative counters (cpu_time_ns, net/disk bytes) are
+                # converted to per-interval rates for the "usage over
+                # time" charts -- a running total isn't very readable.
+                for prev, cur in zip(samples, samples[1:]):
+                    dt = cur["timestamp"] - prev["timestamp"]
+                    if dt <= 0:
+                        continue
+                    x = round(cur["timestamp"] - t0, 1)
+                    cpu_pct_ts.append({
+                        "x": x,
+                        "y": round(100 * (cur.get("cpu_time_ns", 0) -
+                                           prev.get("cpu_time_ns", 0))
+                                   / 1e9 / dt, 1),
+                    })
+                    net_rx_ts.append({
+                        "x": x,
+                        "y": round((cur.get("net_rx_bytes", 0) -
+                                    prev.get("net_rx_bytes", 0)) / 1024 / dt, 1),
+                    })
+                    net_tx_ts.append({
+                        "x": x,
+                        "y": round((cur.get("net_tx_bytes", 0) -
+                                    prev.get("net_tx_bytes", 0)) / 1024 / dt, 1),
+                    })
+                    disk_rd_ts.append({
+                        "x": x,
+                        "y": round((cur.get("disk_rd_bytes", 0) -
+                                    prev.get("disk_rd_bytes", 0)) / 1024 / dt, 1),
+                    })
+                    disk_wr_ts.append({
+                        "x": x,
+                        "y": round((cur.get("disk_wr_bytes", 0) -
+                                    prev.get("disk_wr_bytes", 0)) / 1024 / dt, 1),
+                    })
             break
 
         iter_data["cpu_ts"] = cpu_ts
         iter_data["mem_ts"] = mem_ts
+        iter_data["cpu_pct_ts"] = cpu_pct_ts
+        iter_data["net_rx_ts"] = net_rx_ts
+        iter_data["net_tx_ts"] = net_tx_ts
+        iter_data["disk_rd_ts"] = disk_rd_ts
+        iter_data["disk_wr_ts"] = disk_wr_ts
         charts["per_target"][label] = iter_data
 
     # Delta size comparison data (for delta benchmarks)
@@ -385,6 +483,33 @@ def build_chart_data(data: dict) -> dict:
             round(delta_arts.get("delta_size_bytes", 0) / 1024**2, 1)
         )
     charts["delta_size"] = delta_size_data
+
+    # Cross-scenario network/disk I/O comparison (mean bytes observed
+    # during the monitored window, in MB). One bar group per benchmark
+    # scenario, labeled with mode/variant/network-profile so comparisons
+    # like "bootc upgrade vs. delta, under a constrained network" are
+    # readable at a glance.
+    io_data = {"labels": [], "net_mb": [], "disk_mb": []}
+    for bench in data["benchmarks"]:
+        summary = bench.get("summary", {})
+        net_rx = summary.get("net_rx_bytes", {}).get("mean")
+        net_tx = summary.get("net_tx_bytes", {}).get("mean")
+        disk_rd = summary.get("disk_rd_bytes", {}).get("mean")
+        disk_wr = summary.get("disk_wr_bytes", {}).get("mean")
+        if net_rx is None and disk_rd is None:
+            continue
+        label_parts = [get_mode(bench)]
+        if bench.get("variant") == "customized":
+            label_parts.append("custom")
+        profile = bench.get("network_profile", "none")
+        if profile and profile != "none":
+            label_parts.append(profile)
+        io_data["labels"].append(
+            f"{short_image_ref(bench['target_image'])} ({', '.join(label_parts)})"
+        )
+        io_data["net_mb"].append(round(((net_rx or 0) + (net_tx or 0)) / 1024**2, 2))
+        io_data["disk_mb"].append(round(((disk_rd or 0) + (disk_wr or 0)) / 1024**2, 2))
+    charts["io_comparison"] = io_data
 
     return charts
 
@@ -453,10 +578,15 @@ def generate_html(data: dict) -> str:
             if bench_variant == "customized"
             else '<span class="badge badge-vanilla">vanilla</span>'
         )
+        profile = bench.get("network_profile", "none")
+        profile_badge = (
+            f'<span class="badge badge-profile">{html.escape(profile)}</span>'
+            if profile != "none" else ""
+        )
 
         target_sections.append(f"""
         <div class="target-section" id="target-{safe_id}">
-            <h3>→ {html.escape(label)} {mode_badge} {upgrade_badge} {variant_badge}</h3>
+            <h3>→ {html.escape(label)} {mode_badge} {upgrade_badge} {variant_badge} {profile_badge}</h3>
             {artifacts_html}
             {error_html}
             {iter_table}
@@ -465,12 +595,26 @@ def generate_html(data: dict) -> str:
                     <canvas id="iter-chart-{safe_id}"></canvas>
                 </div>
                 <div class="chart-container">
+                    <canvas id="cpu-chart-{safe_id}"></canvas>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container">
                     <canvas id="mem-chart-{safe_id}"></canvas>
+                </div>
+                <div class="chart-container">
+                    <canvas id="net-chart-{safe_id}"></canvas>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container">
+                    <canvas id="disk-chart-{safe_id}"></canvas>
                 </div>
             </div>
         </div>""")
 
     summary_table = build_summary_table(data)
+    show_io = has_io_stats(data)
 
     # Delta size chart section
     delta_size_chart_html = ""
@@ -478,6 +622,14 @@ def generate_html(data: dict) -> str:
         delta_size_chart_html = """
         <div class="main-chart">
             <canvas id="delta-size-chart"></canvas>
+        </div>"""
+
+    # Cross-scenario network/disk I/O comparison chart
+    io_comparison_chart_html = ""
+    if show_io:
+        io_comparison_chart_html = """
+        <div class="main-chart">
+            <canvas id="io-comparison-chart"></canvas>
         </div>"""
 
     mode_desc = {
@@ -581,6 +733,11 @@ def generate_html(data: dict) -> str:
                 background: rgba(63, 185, 80, 0.15);
                 color: var(--green);
                 border: 1px solid rgba(63, 185, 80, 0.3);
+            }}
+            .badge-profile {{
+                background: rgba(248, 81, 73, 0.15);
+                color: var(--red);
+                border: 1px solid rgba(248, 81, 73, 0.3);
             }}
             table {{
                 width: 100%;
@@ -704,6 +861,7 @@ def generate_html(data: dict) -> str:
         <div class="config-box">
             <strong>Base image:</strong> <code>{html.escape(config.get('base_image', 'N/A'))}</code>{extra_config_lines}<br>
             <strong>Mode:</strong> <span class="badge badge-{'delta' if mode == 'delta' else 'baseline'}">{mode}</span><br>
+            <strong>Network profile:</strong> <code>{html.escape(config.get('network_profile', 'none'))}</code><br>
             <strong>Iterations:</strong> {config.get('iterations', 'N/A')} per target<br>
             <strong>VM:</strong> {config.get('vm_vcpus', '?')} vCPUs, {config.get('vm_memory_mb', '?')} MB RAM<br>
             <strong>Run date:</strong> {config.get('timestamp', 'N/A')[:19]}
@@ -718,6 +876,9 @@ def generate_html(data: dict) -> str:
 
         {delta_size_chart_html}
 
+        {'<h2>Network &amp; Disk I/O Comparison</h2>' if show_io else ''}
+        {io_comparison_chart_html}
+
         <h2>Per-Target Details</h2>
         {''.join(target_sections)}
 
@@ -729,6 +890,7 @@ def generate_html(data: dict) -> str:
         <script>
         const chartData = {json.dumps(chart_data).replace("</", "<\\/")};
         const hasDelta = {json.dumps(show_delta)};
+        const hasIo = {json.dumps(show_io)};
 
         Chart.defaults.color = '#8b949e';
         Chart.defaults.borderColor = '#30363d';
@@ -868,6 +1030,48 @@ def generate_html(data: dict) -> str:
             }});
         }}
 
+        // --- Network/disk I/O comparison chart (across scenarios) ---
+        if (hasIo && chartData.io_comparison && chartData.io_comparison.labels.length > 0) {{
+            new Chart(document.getElementById('io-comparison-chart'), {{
+                type: 'bar',
+                data: {{
+                    labels: chartData.io_comparison.labels,
+                    datasets: [
+                        {{
+                            label: 'Network I/O (MB)',
+                            data: chartData.io_comparison.net_mb,
+                            backgroundColor: 'rgba(248, 81, 73, 0.5)',
+                            borderColor: 'rgba(248, 81, 73, 1)',
+                            borderWidth: 1,
+                        }},
+                        {{
+                            label: 'Disk I/O (MB)',
+                            data: chartData.io_comparison.disk_mb,
+                            backgroundColor: 'rgba(210, 153, 34, 0.5)',
+                            borderColor: 'rgba(210, 153, 34, 1)',
+                            borderWidth: 1,
+                        }}
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    plugins: {{
+                        title: {{
+                            display: true,
+                            text: 'Network & Disk I/O by Scenario (mean, libvirt-sampled)',
+                            color: '#e6edf3',
+                            font: {{ size: 16 }},
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            title: {{ display: true, text: 'MB' }},
+                        }}
+                    }}
+                }}
+            }});
+        }}
+
         // --- Per-target charts ---
         for (const [label, tdata] of Object.entries(chartData.per_target)) {{
             const safeId = label.replace(/:/g, '-').replace(/\\//g, '-')
@@ -974,6 +1178,143 @@ def generate_html(data: dict) -> str:
                             }},
                             y: {{
                                 title: {{ display: true, text: 'RSS (MB)' }},
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+
+            // CPU utilization time series (% of one core, from libvirt
+            // cumulative CPU time)
+            const cpuCanvas = document.getElementById('cpu-chart-' + safeId);
+            if (cpuCanvas && tdata.cpu_pct_ts && tdata.cpu_pct_ts.length > 0) {{
+                new Chart(cpuCanvas, {{
+                    type: 'line',
+                    data: {{
+                        datasets: [{{
+                            label: 'CPU (% of 1 core)',
+                            data: tdata.cpu_pct_ts,
+                            borderColor: 'rgba(63, 185, 80, 0.8)',
+                            backgroundColor: 'rgba(63, 185, 80, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 1,
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'CPU Usage (iteration 1)',
+                                color: '#e6edf3',
+                            }}
+                        }},
+                        scales: {{
+                            x: {{
+                                type: 'linear',
+                                title: {{ display: true, text: 'Time (seconds)' }},
+                            }},
+                            y: {{
+                                title: {{ display: true, text: '% of 1 core' }},
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+
+            // Network I/O time series (rate, from libvirt interfaceStats)
+            const netCanvas = document.getElementById('net-chart-' + safeId);
+            if (netCanvas && tdata.net_rx_ts && tdata.net_rx_ts.length > 0) {{
+                new Chart(netCanvas, {{
+                    type: 'line',
+                    data: {{
+                        datasets: [
+                            {{
+                                label: 'Receive (KB/s)',
+                                data: tdata.net_rx_ts,
+                                borderColor: 'rgba(88, 166, 255, 0.8)',
+                                backgroundColor: 'rgba(88, 166, 255, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                pointRadius: 1,
+                            }},
+                            {{
+                                label: 'Transmit (KB/s)',
+                                data: tdata.net_tx_ts,
+                                borderColor: 'rgba(248, 81, 73, 0.8)',
+                                backgroundColor: 'rgba(248, 81, 73, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                pointRadius: 1,
+                            }}
+                        ]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Network I/O (iteration 1)',
+                                color: '#e6edf3',
+                            }}
+                        }},
+                        scales: {{
+                            x: {{
+                                type: 'linear',
+                                title: {{ display: true, text: 'Time (seconds)' }},
+                            }},
+                            y: {{
+                                title: {{ display: true, text: 'KB/s' }},
+                            }}
+                        }}
+                    }}
+                }});
+            }}
+
+            // Disk I/O time series (rate, from libvirt blockStats)
+            const diskCanvas = document.getElementById('disk-chart-' + safeId);
+            if (diskCanvas && tdata.disk_rd_ts && tdata.disk_rd_ts.length > 0) {{
+                new Chart(diskCanvas, {{
+                    type: 'line',
+                    data: {{
+                        datasets: [
+                            {{
+                                label: 'Read (KB/s)',
+                                data: tdata.disk_rd_ts,
+                                borderColor: 'rgba(210, 153, 34, 0.8)',
+                                backgroundColor: 'rgba(210, 153, 34, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                pointRadius: 1,
+                            }},
+                            {{
+                                label: 'Write (KB/s)',
+                                data: tdata.disk_wr_ts,
+                                borderColor: 'rgba(57, 210, 192, 0.8)',
+                                backgroundColor: 'rgba(57, 210, 192, 0.1)',
+                                fill: true,
+                                tension: 0.3,
+                                pointRadius: 1,
+                            }}
+                        ]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Disk I/O (iteration 1)',
+                                color: '#e6edf3',
+                            }}
+                        }},
+                        scales: {{
+                            x: {{
+                                type: 'linear',
+                                title: {{ display: true, text: 'Time (seconds)' }},
+                            }},
+                            y: {{
+                                title: {{ display: true, text: 'KB/s' }},
                             }}
                         }}
                     }}
