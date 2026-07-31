@@ -1690,153 +1690,57 @@ def _create_blob_supplement(
     target_archive: Path,
     supplement_path: Path,
 ) -> list[str]:
-    """Find blobs that oci-delta skips and extract them from the target archive.
+    """Extract the delta's "reused" blobs from the target archive.
 
-    oci-delta skips layers that are byte-identical between old and new images.
-    The apply step then produces an incomplete archive.  This function
-    identifies the missing blobs by comparing the delta's layer list against
-    the target manifest and extracts them into a small supplement tar.
+    Per the oci-delta delta-file-format spec, the delta manifest carries an
+    `io.github.containers.delta.reused` annotation: a JSON array of the
+    exact digests omitted from the delta because they're expected to
+    already be present on the target system (matched by diff_id against
+    locally installed ostree content). oci-delta apply's reconstructed
+    archive is therefore correctly missing these blobs -- but
+    `bootc switch --transport=oci-archive` needs a self-contained archive
+    and doesn't perform the diff_id-based local lookup a registry pull
+    would. Extract those exact digests from the target archive (guaranteed
+    to have them, since they come from the target's own manifest) into a
+    small supplement tar that gets appended to the reconstructed archive
+    before switching.
 
-    Returns a list of missing blob digests (empty if none are skipped).
+    This reads the authoritative annotation directly rather than trying to
+    infer "shared" blobs by comparing archive contents: that heuristic
+    breaks whenever the "old" image has been recompressed relative to its
+    origin (e.g. after a local podman build + skopeo export round-trip),
+    since the compressed digest can change even though the diff_id (and
+    thus oci-delta's own reuse decision) does not.
+
+    Returns the list of reused blob digests (empty if none).
     """
     import tarfile as _tarfile
 
-    # 1. Read target manifest to get all required blob digests
-    with _tarfile.open(str(target_archive)) as tgt:
-        idx = json.load(tgt.extractfile("index.json"))
-        manifest_path = idx["manifests"][0]["digest"].replace(
-            "sha256:", "blobs/sha256/"
-        )
-        manifest = json.load(tgt.extractfile(manifest_path))
-        required = {}  # digest -> blob path
-        required[manifest["config"]["digest"]] = manifest["config"]["digest"].replace(
-            "sha256:", "blobs/sha256/"
-        )
-        for layer in manifest["layers"]:
-            required[layer["digest"]] = layer["digest"].replace(
-                "sha256:", "blobs/sha256/"
-            )
-
-    # 2. Read delta manifest to find which target digests it covers.
-    #    Each delta layer has an annotation with the target layer digest
-    #    it will reconstruct, or it's a copy of the original blob.
     with _tarfile.open(str(delta_file)) as dtf:
         didx = json.load(dtf.extractfile("index.json"))
         dmanifest_path = didx["manifests"][0]["digest"].replace(
             "sha256:", "blobs/sha256/"
         )
         dmanifest = json.load(dtf.extractfile(dmanifest_path))
+        reused_json = dmanifest.get("annotations", {}).get(
+            "io.github.containers.delta.reused"
+        )
 
-        # Collect digests the delta covers:
-        # - tar-diff layers: the annotation 'io.github.containers.delta.to'
-        #   gives the target compressed digest
-        # - original-copy layers: the blob digest IS the target digest
-        # - config/manifest entries: marked with delta.content annotations
-        covered = set()
-        delta_blob_names = set(dtf.getnames())
-
-        for layer in dmanifest["layers"]:
-            ann = layer.get("annotations", {})
-            content_type = ann.get("io.github.containers.delta.content", "")
-
-            if content_type == "image-config":
-                # The delta stores the target config directly
-                covered.add(manifest["config"]["digest"])
-            elif content_type == "image-manifest":
-                # Not a blob we need in the output
-                pass
-            elif content_type == "image-layer":
-                # tar-diff: the 'to' annotation has the OLD compressed digest,
-                # but the reconstructed layer gets a NEW digest after
-                # decompression + recompression.  The delta apply matches by
-                # diff_id (uncompressed), so it covers the layer regardless
-                # of the final compressed digest.
-                # Mark as covered by position.
-                pass
-            else:
-                # Original blob copy — its digest is the target digest
-                blob_path = layer["digest"].replace("sha256:", "blobs/sha256/")
-                if blob_path in delta_blob_names:
-                    covered.add(layer["digest"])
-
-    # 3. Since tar-diffs are matched by position/diff_id, we can't easily
-    #    map them to target digests here.  Instead, do a simpler check:
-    #    count how many layers the delta processes (tar-diffs + copies)
-    #    vs how many the target needs.  Any shortfall = skipped layers.
-    #
-    #    More reliable: just count non-meta layers in the delta manifest.
-    delta_layer_count = sum(
-        1 for l in dmanifest["layers"]
-        if l.get("annotations", {}).get(
-            "io.github.containers.delta.content", ""
-        ) == "image-layer"
-    )
-    # Add original-copy layers (no delta.content annotation, and blob exists in delta)
-    delta_copy_count = sum(
-        1 for l in dmanifest["layers"]
-        if not l.get("annotations", {}).get("io.github.containers.delta.content")
-        and l["digest"].replace("sha256:", "blobs/sha256/") in delta_blob_names
-    )
-    total_delta_layers = delta_layer_count + delta_copy_count
-    target_layer_count = len(manifest["layers"])
-
-    if total_delta_layers >= target_layer_count:
-        # No skipped layers
+    reused = json.loads(reused_json) if reused_json else []
+    if not reused:
         if supplement_path.exists():
             supplement_path.unlink()
         return []
 
-    # 4. We know there are skipped layers.  To find exactly which ones,
-    #    do a test: run oci-delta apply to a temp location and check
-    #    which blobs are missing.  This is the most reliable method.
-    #    But it requires the source image too.
-    #
-    #    Simpler heuristic: layers in the target that also exist in the
-    #    OLD archive with the same digest are the ones oci-delta skips.
-    with _tarfile.open(str(target_archive)) as tgt:
-        # Get path to old archive — it's the source used to create the delta.
-        # We figure out which archive by looking at what prepare_delta_artifacts
-        # computed.  For now, find it from the delta filename.
-        old_archive_path = delta_file.parent / (
-            delta_file.name.split("-to-")[0] + ".oci-archive"
-        )
-        if not old_archive_path.exists():
-            log.warning("Cannot find old archive to identify skipped blobs: %s",
-                        old_archive_path)
-            return []
+    log.info("Extracting %d reused blob(s) into supplement...", len(reused))
+    with _tarfile.open(str(target_archive)) as tgt, \
+            _tarfile.open(str(supplement_path), "w") as sup:
+        for digest in reused:
+            blob_path = digest.replace("sha256:", "blobs/sha256/")
+            member = tgt.getmember(blob_path)
+            sup.addfile(member, tgt.extractfile(blob_path))
 
-        with _tarfile.open(str(old_archive_path)) as old:
-            old_blob_names = set(old.getnames())
-
-            # Blobs that exist in both old and target archives (by path = same digest)
-            target_blob_paths = set()
-            for layer in manifest["layers"]:
-                target_blob_paths.add(
-                    layer["digest"].replace("sha256:", "blobs/sha256/")
-                )
-
-            shared_blobs = target_blob_paths & old_blob_names
-            # The skipped count should match: target_layers - delta_layers
-            expected_skipped = target_layer_count - total_delta_layers
-            if len(shared_blobs) != expected_skipped:
-                log.warning(
-                    "Expected %d skipped blobs but found %d shared; "
-                    "extracting all shared blobs to be safe",
-                    expected_skipped, len(shared_blobs),
-                )
-
-            if not shared_blobs:
-                return []
-
-            # 5. Extract shared (skipped) blobs from target archive into supplement
-            log.info("Extracting %d skipped blobs into supplement...",
-                     len(shared_blobs))
-            with _tarfile.open(str(supplement_path), "w") as sup:
-                for blob_path in sorted(shared_blobs):
-                    member = tgt.getmember(blob_path)
-                    sup.addfile(member, tgt.extractfile(blob_path))
-
-    return sorted(shared_blobs)
+    return reused
 
 
 DERIVED_IMAGE_TAG = "localhost/bootc-bench-base:latest"
