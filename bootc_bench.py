@@ -54,6 +54,10 @@ BIB_IMAGE = "registry.redhat.io/rhel9/bootc-image-builder"
 # Upstream bootc-image-builder, used automatically for non-RHEL base images
 # (e.g. Fedora) that don't have registry.redhat.io entitlements.
 FEDORA_BIB_IMAGE = "quay.io/centos-bootc/bootc-image-builder:latest"
+# quay.io/fedora/fedora-bootc doesn't carry a rootfs label BIB can read
+# (unlike RHEL's rhel-bootc images), so BIB fails with "missing required
+# info: DefaultRootFs" unless --rootfs is passed explicitly.
+FEDORA_BIB_ROOTFS = "ext4"
 OCI_DELTA_BIN_DEFAULT = "./oci-delta"
 REGISTRY_CONTAINER_NAME = "bootc-bench-registry"
 REGISTRY_IMAGE = "docker.io/library/registry:2"
@@ -744,6 +748,7 @@ def build_base_qcow2(
     output_dir: Path,
     ssh_pub_key_path: Path,
     bib_image: str = BIB_IMAGE,
+    bib_rootfs: Optional[str] = None,
 ) -> Path:
     """Build a qcow2 disk image from the base bootc container image.
 
@@ -815,6 +820,8 @@ def build_base_qcow2(
     if authfile:
         bib_cmd.extend(["-v", f"{authfile}:/run/containers/0/auth.json:ro"])
     bib_cmd.extend([bib_image, "--type", "qcow2", "--local", derived_tag])
+    if bib_rootfs:
+        bib_cmd.extend(["--rootfs", bib_rootfs])
     subprocess.run(bib_cmd, check=True)
 
     # bootc-image-builder outputs to /output/qcow2/disk.qcow2
@@ -897,6 +904,7 @@ def build_customized_qcow2(
     output_dir: Path,
     ssh_pub_key_path: Path,
     bib_image: str = BIB_IMAGE,
+    bib_rootfs: Optional[str] = None,
 ) -> Path:
     """Build a qcow2 from a customized (packages-layered) base image.
 
@@ -935,6 +943,8 @@ def build_customized_qcow2(
     if authfile:
         bib_cmd.extend(["-v", f"{authfile}:/run/containers/0/auth.json:ro"])
     bib_cmd.extend([bib_image, "--type", "qcow2", "--local", derived_tag])
+    if bib_rootfs:
+        bib_cmd.extend(["--rootfs", bib_rootfs])
     subprocess.run(bib_cmd, check=True)
 
     built_qcow2 = bib_output / "qcow2" / "disk.qcow2"
@@ -2216,15 +2226,6 @@ def run_benchmark(args) -> dict:
     customize = not args.no_customize
     network_profile = getattr(args, "network_profile", "none")
 
-    # Pick a working bootc-image-builder image. registry.redhat.io's BIB
-    # requires RHEL entitlements; auto-switch to the upstream image for
-    # non-RHEL (e.g. Fedora) base images unless explicitly overridden.
-    bib_image = args.bib_image
-    if not bib_image:
-        bib_image = (FEDORA_BIB_IMAGE if "fedora" in base_image.lower()
-                     else BIB_IMAGE)
-    log.info("Using bootc-image-builder image: %s", bib_image)
-
     # Z-stream discovery
     zstream_target = None
     if args.base_stream:
@@ -2234,6 +2235,16 @@ def run_benchmark(args) -> dict:
         zstream_target = newest_ref
         log.info("Base (oldest z-stream): %s", base_image)
         log.info("Z-stream target (newest): %s", zstream_target)
+
+    # Pick a working bootc-image-builder image/rootfs. registry.redhat.io's
+    # BIB requires RHEL entitlements, and Fedora's bootc images don't carry
+    # a rootfs label BIB can read; auto-switch both for non-RHEL (e.g.
+    # Fedora) base images unless explicitly overridden.
+    is_fedora = "fedora" in base_image.lower()
+    bib_image = args.bib_image or (FEDORA_BIB_IMAGE if is_fedora else BIB_IMAGE)
+    bib_rootfs = args.bib_rootfs or (FEDORA_BIB_ROOTFS if is_fedora else None)
+    log.info("Using bootc-image-builder image: %s (rootfs=%s)",
+             bib_image, bib_rootfs or "<image default>")
 
     # Y-stream targets from CLI (explicit --targets)
     ystream_targets = args.targets or []
@@ -2252,14 +2263,14 @@ def run_benchmark(args) -> dict:
         log.info("Using provided qcow2: %s", vanilla_qcow2)
     else:
         vanilla_qcow2 = build_base_qcow2(base_image, cache_dir, ssh_pub,
-                                          bib_image=bib_image)
+                                          bib_image=bib_image, bib_rootfs=bib_rootfs)
 
     # Build customized base qcow2
     custom_qcow2 = None
     if customize:
         log.info("Building customized base with packages: %s", ", ".join(packages))
         custom_qcow2 = build_customized_qcow2(base_image, packages, cache_dir, ssh_pub,
-                                               bib_image=bib_image)
+                                               bib_image=bib_image, bib_rootfs=bib_rootfs)
 
     # Construct scenario list
     # Each scenario = dict with upgrade_type, variant, base_image, target_image,
@@ -2615,6 +2626,14 @@ def main():
         help="bootc-image-builder container image to use. Defaults to "
              f"{FEDORA_BIB_IMAGE!r} when --base-image contains 'fedora', "
              f"otherwise {BIB_IMAGE!r}.",
+    )
+    parser.add_argument(
+        "--bib-rootfs", default=None,
+        help="Root filesystem type to pass to bootc-image-builder's "
+             "--rootfs (e.g. ext4, xfs, btrfs). Needed for images that "
+             "don't carry a rootfs label BIB can read. Defaults to "
+             f"{FEDORA_BIB_ROOTFS!r} when --base-image contains 'fedora', "
+             "otherwise unset (BIB uses the image's own default).",
     )
     parser.add_argument(
         "--cache-dir", default=None,
